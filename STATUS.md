@@ -10,3 +10,4 @@
 - 🟡 dataset study
 ## Requests to other members
 - (name) → (name): ...
+Branch protection test
