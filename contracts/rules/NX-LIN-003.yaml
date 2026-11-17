@@ -1,0 +1,27 @@
+id: NX-LIN-003
+version: "1.0"
+title: Lab test binary executes and connects outbound (automatic response demo)
+kind: sequence
+os: [linux]
+severity: high
+technique_ids: [T1204.002, T1071]
+window_seconds: 30
+ordered: true
+context:
+  max_ancestors: 2
+  max_descendant_depth: 2
+  incident_window_seconds: 120
+steps:
+  - step: bin
+    event_type: process_start
+    where:
+      binary: { prefix_any: ["/lab/bin/"] }
+  - step: net
+    event_type: network_connect
+    where:
+      network.direction: { equals: outbound }
+      network.dst_ip: { not_in_cidr: ["127.0.0.0/8", "192.168.10.1/32"] }
+    lineage: { relation: same, of: bin }
+response:
+  action: terminate_process
+  target_step: bin

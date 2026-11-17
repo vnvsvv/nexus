@@ -1,0 +1,15 @@
+{
+  "endpoint_id": "linux-vm-01",
+  "os": "linux",
+  "sent_at_utc": "2026-11-15T10:30:00.000Z",
+  "agent_version": "0.1.0",
+  "ip_addresses": [
+    "192.168.10.10"
+  ],
+  "clock_offset_ms": -3.2,
+  "sensor_status": "ok",
+  "events_per_minute": 42.0,
+  "dropped_events": 0,
+  "outbox_depth": 0,
+  "dry_run": true
+}

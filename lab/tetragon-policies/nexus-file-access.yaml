@@ -1,0 +1,41 @@
+# Tetragon TracingPolicy: read/write access to protected lab paths. Place in /etc/tetragon/tetragon.tp.d/
+# Hooks security_file_permission (common path for read/write/mmap/io_uring). Arg1: 0x04 = MAY_READ, 0x02 = MAY_WRITE.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "nexus-file-access"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    return: true
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int"
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/lab/protected/"
+        - "/etc/shadow"
+        - "/etc/sudoers"
+      - index: 1
+        operator: "Equal"
+        values:
+        - "4"   # MAY_READ
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/lab/protected/"
+        - "/lab/staging/"
+      - index: 1
+        operator: "Equal"
+        values:
+        - "2"   # MAY_WRITE

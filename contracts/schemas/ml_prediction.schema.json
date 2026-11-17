@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/ml_prediction.schema.json",
+  "title": "MLPrediction",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["label", "score", "threshold", "model_version", "feature_version", "predicted_at_utc"],
+  "properties": {
+    "label": { "enum": ["benign", "suspicious"] },
+    "score": { "type": "number", "minimum": 0, "maximum": 1, "description": "Raw model score (e.g. tree-vote fraction). NOT a calibrated probability." },
+    "threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+    "model_version": { "type": "string", "pattern": "^ids-[a-z0-9]+-[0-9]{3}$" },
+    "feature_version": { "const": "nf-lite-1" },
+    "predicted_at_utc": { "type": "string", "format": "date-time" }
+  }
+}

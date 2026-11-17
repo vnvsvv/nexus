@@ -1,0 +1,16 @@
+{
+  "command_id": "cmd-0001",
+  "target_kind": "endpoint",
+  "endpoint_id": "linux-vm-01",
+  "incident_id": "linux-vm-01:INC-20261115T103007-0001",
+  "action": "terminate_process",
+  "params": {
+    "process_instance_id": "linux-vm-01:exec-curl01",
+    "pid": 4215,
+    "binary": "/usr/bin/curl"
+  },
+  "requested_by": "user:anas",
+  "created_utc": "2026-11-15T10:30:30.000Z",
+  "dry_run": true,
+  "status": "queued"
+}

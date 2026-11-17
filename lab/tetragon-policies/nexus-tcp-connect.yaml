@@ -1,0 +1,13 @@
+# Tetragon TracingPolicy: outbound TCP connect with 5-tuple. Place in /etc/tetragon/tetragon.tp.d/
+# Verified pattern from the Tetragon network-observability docs (tcp_connect with a sock argument).
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "nexus-tcp-connect"
+spec:
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/gateway_connection.schema.json",
+  "title": "GatewayConnection",
+  "description": "A connection routed by the gateway, recorded from conntrack. 'orig_*' is the initiator->responder direction as conntrack saw the first packet.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["gateway_connection_id", "protocol", "orig_src_ip", "orig_src_port", "orig_dst_ip", "orig_dst_port", "first_seen_utc", "state"],
+  "properties": {
+    "gateway_connection_id": { "type": "string", "pattern": "^gw:conn-[0-9A-Za-z-]+$" },
+    "protocol": { "enum": ["TCP", "UDP", "ICMP"] },
+    "orig_src_ip": { "type": "string" },
+    "orig_src_port": { "type": "integer" },
+    "orig_dst_ip": { "type": "string" },
+    "orig_dst_port": { "type": "integer" },
+    "first_seen_utc": { "type": "string", "format": "date-time" },
+    "last_seen_utc": { "type": ["string", "null"], "format": "date-time" },
+    "ingress_interface": { "type": ["string", "null"] },
+    "src_endpoint_id": { "type": ["string", "null"] },
+    "dst_endpoint_id": { "type": ["string", "null"] },
+    "packets_orig": { "type": ["integer", "null"] },
+    "bytes_orig": { "type": ["integer", "null"] },
+    "packets_reply": { "type": ["integer", "null"] },
+    "bytes_reply": { "type": ["integer", "null"] },
+    "state": { "enum": ["new", "established", "closed"] },
+    "scope": { "enum": ["routed", "gateway-internal"], "default": "routed" },
+    "flow_ids": { "type": "array", "items": { "type": "string" } }
+  }
+}

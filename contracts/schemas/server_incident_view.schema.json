@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/server_incident_view.schema.json",
+  "title": "ServerIncidentView",
+  "description": "What the dashboard receives: the endpoint incident verbatim plus a server block. The endpoint document is never modified by the server.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["incident", "server"],
+  "properties": {
+    "incident": { "$ref": "incident.schema.json" },
+    "server": {
+      "type": "object", "additionalProperties": false,
+      "required": ["received_at_utc", "correlations", "network_evidence", "enrichment", "response_history", "network_alert_ids"],
+      "properties": {
+        "received_at_utc": { "type": "string", "format": "date-time" },
+        "clock_offset_applied_ms": { "type": ["number", "null"] },
+        "correlations": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["connection_id", "state"],
+            "properties": {
+              "connection_id": { "type": "string" },
+              "state": { "enum": ["matched", "ambiguous", "pending", "unmatched"] },
+              "gateway_connection_id": { "type": ["string", "null"] },
+              "score": { "type": ["number", "null"] },
+              "candidates": { "type": "array", "items": { "type": "object", "required": ["gateway_connection_id", "score"], "properties": { "gateway_connection_id": { "type": "string" }, "score": { "type": "number" } } } },
+              "basis": { "enum": ["observed", "inferred"] },
+              "note": { "type": ["string", "null"] },
+              "updated_utc": { "type": "string", "format": "date-time" }
+            }
+          }
+        },
+        "network_evidence": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["gateway_connection"],
+            "properties": {
+              "gateway_connection": { "$ref": "gateway_connection.schema.json" },
+              "flows": { "type": "array", "items": { "$ref": "flow_record.schema.json" } }
+            }
+          }
+        },
+        "enrichment": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["indicator_type", "value", "source", "verdict", "fetched_utc"],
+            "properties": {
+              "indicator_type": { "enum": ["sha256", "ip", "domain", "url", "ip_port"] },
+              "value": { "type": "string" },
+              "source": { "type": "string" },
+              "verdict": { "enum": ["malicious", "suspicious", "unknown", "clean", "lab-test"] },
+              "tags": { "type": "array", "items": { "type": "string" } },
+              "detail": { "type": "object", "additionalProperties": true },
+              "fetched_utc": { "type": "string", "format": "date-time" }
+            }
+          }
+        },
+        "response_history": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["command", "result"],
+            "properties": {
+              "command": { "$ref": "response_command.schema.json" },
+              "result": { "anyOf": [ { "$ref": "response_result.schema.json" }, { "type": "null" } ] }
+            }
+          }
+        },
+        "network_alert_ids": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

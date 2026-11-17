@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/heartbeat.schema.json",
+  "title": "Heartbeat",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["endpoint_id", "os", "sent_at_utc", "agent_version", "ip_addresses", "sensor_status"],
+  "properties": {
+    "endpoint_id": { "type": "string" },
+    "os": { "enum": ["linux", "windows"] },
+    "sent_at_utc": { "type": "string", "format": "date-time" },
+    "agent_version": { "type": "string" },
+    "ip_addresses": { "type": "array", "items": { "type": "string" } },
+    "clock_offset_ms": { "type": ["number", "null"], "description": "endpoint_clock - server_clock, measured by the agent from the previous heartbeat round-trip" },
+    "sensor_status": { "enum": ["ok", "degraded", "down"] },
+    "events_per_minute": { "type": ["number", "null"] },
+    "dropped_events": { "type": ["integer", "null"] },
+    "outbox_depth": { "type": ["integer", "null"] },
+    "dry_run": { "type": "boolean" }
+  }
+}

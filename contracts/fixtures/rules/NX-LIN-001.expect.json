@@ -1,0 +1,17 @@
+{
+  "rule_id": "NX-LIN-001",
+  "fires": true,
+  "bindings": {
+    "interp": "linux-vm-01:evt-000000000001",
+    "shell": "linux-vm-01:evt-000000000002",
+    "read": "linux-vm-01:evt-000000000004",
+    "net": "linux-vm-01:evt-000000000007"
+  },
+  "root_process_instance_id": "linux-vm-01:exec-py01",
+  "expected_process_instance_ids": [
+    "linux-vm-01:exec-py01",
+    "linux-vm-01:exec-bash01",
+    "linux-vm-01:exec-cat01",
+    "linux-vm-01:exec-curl01"
+  ]
+}

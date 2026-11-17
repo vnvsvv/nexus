@@ -1,0 +1,22 @@
+{
+  "gateway_connection_id": "gw:conn-00500",
+  "protocol": "TCP",
+  "orig_src_ip": "192.168.10.10",
+  "orig_src_port": 51542,
+  "orig_dst_ip": "192.168.20.10",
+  "orig_dst_port": 8443,
+  "first_seen_utc": "2026-11-15T10:30:06.012Z",
+  "last_seen_utc": "2026-11-15T10:30:08.100Z",
+  "ingress_interface": "ens-lin",
+  "src_endpoint_id": "linux-vm-01",
+  "dst_endpoint_id": "windows-vm-01",
+  "packets_orig": 9,
+  "bytes_orig": 1812,
+  "packets_reply": 7,
+  "bytes_reply": 614,
+  "state": "closed",
+  "scope": "routed",
+  "flow_ids": [
+    "gw:flow-00500"
+  ]
+}

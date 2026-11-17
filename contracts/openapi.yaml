@@ -1,0 +1,234 @@
+openapi: 3.1.0
+info:
+  title: NEXUS Server API
+  version: "1.0"
+  description: |
+    Single API served by server/api_service over HTTPS (port 8443). Two bearer-token audiences:
+    - endpoint tokens (one per endpoint, config file on the agent; hash stored in `endpoints.token_hash`)
+    - dashboard token (one per deployment; stored in the dashboard's local settings)
+    All request/response bodies are validated against contracts/schemas/*.json. All timestamps are UTC ISO-8601 with milliseconds.
+    Agents never receive inbound connections: commands are polled.
+servers:
+  - url: https://nexus-server:8443/api/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: agent
+    description: Called by endpoint agents
+  - name: dashboard
+    description: Called by the dashboard (read + manual response)
+paths:
+  /health:
+    get:
+      security: []
+      summary: Liveness and component status
+      responses:
+        "200":
+          description: ok
+          content: { application/json: { schema: { type: object, properties: { status: { type: string }, components: { type: object, additionalProperties: { type: string } }, model_version: { type: string }, server_time_utc: { type: string } } } } }
+
+  /endpoints/{endpoint_id}/heartbeat:
+    post:
+      tags: [agent]
+      summary: Heartbeat (every 30 s). Response carries the server time for clock-offset measurement.
+      parameters: [ { $ref: "#/components/parameters/endpoint_id" } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "schemas/heartbeat.schema.json" } } } }
+      responses:
+        "200":
+          description: accepted
+          content: { application/json: { schema: { type: object, required: [server_time_utc, ti_hashes_version], properties: { server_time_utc: { type: string }, ti_hashes_version: { type: string }, config_hints: { type: object } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /incidents:
+    post:
+      tags: [agent]
+      summary: Upsert an incident (idempotent on endpoint_id + incident_id + incident_version)
+      description: |
+        Same incident_id with a higher incident_version replaces the stored document and re-runs correlation and enrichment.
+        A lower or equal version is acknowledged with 200 and ignored (status "stale" or "duplicate").
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "schemas/incident.schema.json" } } } }
+      responses:
+        "200":
+          description: stored or ignored
+          content: { application/json: { schema: { type: object, required: [status, incident_id, incident_version], properties: { status: { enum: [stored, duplicate, stale] }, incident_id: { type: string }, incident_version: { type: integer } } } } }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    get:
+      tags: [dashboard]
+      summary: List incidents (newest first)
+      parameters:
+        - { name: status, in: query, schema: { enum: [open, closed] } }
+        - { name: endpoint_id, in: query, schema: { type: string } }
+        - { name: severity, in: query, schema: { enum: [low, medium, high, critical] } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        "200":
+          description: page
+          content: { application/json: { schema: { type: object, required: [items, total], properties: { items: { type: array, items: { $ref: "#/components/schemas/IncidentSummary" } }, total: { type: integer } } } } }
+
+  /incidents/{incident_id}:
+    get:
+      tags: [dashboard]
+      summary: Full server incident view
+      parameters: [ { $ref: "#/components/parameters/incident_id" } ]
+      responses:
+        "200": { description: view, content: { application/json: { schema: { $ref: "schemas/server_incident_view.schema.json" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /incidents/{incident_id}/correlations/{connection_id}/pin:
+    post:
+      tags: [dashboard]
+      summary: Analyst pins one candidate of an ambiguous correlation (recorded as basis=inferred)
+      parameters: [ { $ref: "#/components/parameters/incident_id" }, { name: connection_id, in: path, required: true, schema: { type: string } } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [gateway_connection_id, note], properties: { gateway_connection_id: { type: string }, note: { type: string } } } } } }
+      responses:
+        "200": { description: updated }
+
+  /endpoints/{endpoint_id}/commands:
+    get:
+      tags: [agent]
+      summary: Poll queued commands (every 5 s). Delivered commands move to status=delivered.
+      parameters: [ { $ref: "#/components/parameters/endpoint_id" } ]
+      responses:
+        "200": { description: commands, content: { application/json: { schema: { type: array, items: { $ref: "schemas/response_command.schema.json" } } } } }
+
+  /commands/{command_id}/result:
+    post:
+      tags: [agent]
+      summary: Report the outcome of a command
+      parameters: [ { name: command_id, in: path, required: true, schema: { type: string } } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "schemas/response_result.schema.json" } } } }
+      responses:
+        "200": { description: recorded }
+
+  /response/commands:
+    post:
+      tags: [dashboard]
+      summary: Create a manual response command (endpoint terminate, gateway block/unblock)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "schemas/response_command.schema.json" } } } }
+      responses:
+        "201": { description: queued/executed, content: { application/json: { schema: { $ref: "schemas/response_command.schema.json" } } } }
+    get:
+      tags: [dashboard]
+      summary: Response history (commands with results)
+      parameters: [ { name: limit, in: query, schema: { type: integer, default: 100 } } ]
+      responses:
+        "200": { description: list, content: { application/json: { schema: { type: array, items: { type: object, properties: { command: { $ref: "schemas/response_command.schema.json" }, result: { $ref: "schemas/response_result.schema.json" } } } } } } }
+
+  /endpoints:
+    get:
+      tags: [dashboard]
+      summary: Endpoint inventory and health
+      responses:
+        "200": { description: list, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/EndpointStatus" } } } } }
+
+  /network/alerts:
+    get:
+      tags: [dashboard]
+      summary: Standalone ML network alerts (not yet linked to an incident, or linked)
+      parameters: [ { name: linked, in: query, schema: { type: boolean } }, { name: limit, in: query, schema: { type: integer, default: 100 } } ]
+      responses:
+        "200": { description: list, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/NetworkAlert" } } } } }
+
+  /network/connections:
+    get:
+      tags: [dashboard]
+      summary: Query the gateway connection registry
+      parameters:
+        - { name: ip, in: query, schema: { type: string } }
+        - { name: port, in: query, schema: { type: integer } }
+        - { name: since, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, default: 200 } }
+      responses:
+        "200": { description: list, content: { application/json: { schema: { type: array, items: { $ref: "schemas/gateway_connection.schema.json" } } } } }
+
+  /network/flows/{flow_id}:
+    get:
+      tags: [dashboard]
+      parameters: [ { name: flow_id, in: path, required: true, schema: { type: string } } ]
+      responses:
+        "200": { description: flow, content: { application/json: { schema: { $ref: "schemas/flow_record.schema.json" } } } }
+
+  /ti/hashes:
+    get:
+      tags: [agent]
+      summary: Compact SHA-256 blocklist for agent-local rule NX-ANY-001 (ETag/If-None-Match supported)
+      responses:
+        "200": { description: newline-separated lowercase sha256, content: { text/plain: { schema: { type: string } } } }
+        "304": { description: unchanged }
+
+  /stream:
+    get:
+      tags: [dashboard]
+      summary: "Server-Sent Events. Event types: incident.created, incident.updated, network_alert.created, endpoint.heartbeat, response.updated"
+      responses:
+        "200": { description: "text/event-stream; data is JSON {type, id, payload_summary}" }
+
+  /export/correlations:
+    get:
+      tags: [dashboard]
+      summary: Evaluation export — correlation rows joined with their incident connection fields (used by nexus-eval)
+      parameters: [ { name: since, in: query, schema: { type: string, format: date-time } } ]
+      responses:
+        "200":
+          description: list
+          content: { application/json: { schema: { type: array, items: { type: object, required: [incident_id, incident_version, endpoint_id, connection, correlation], properties: { incident_id: { type: string }, incident_version: { type: integer }, endpoint_id: { type: string }, detected_at_utc: { type: string }, received_at_utc: { type: string }, connection: { $ref: "schemas/connection.schema.json" }, correlation: { type: object }, gateway_connection: { $ref: "schemas/gateway_connection.schema.json" } } } } } }
+
+  /stats:
+    get:
+      tags: [dashboard]
+      summary: Counters for the overview page and evaluation
+      responses:
+        "200": { description: counters, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+  parameters:
+    endpoint_id: { name: endpoint_id, in: path, required: true, schema: { type: string } }
+    incident_id: { name: incident_id, in: path, required: true, schema: { type: string } }
+  responses:
+    Unauthorized: { description: missing/invalid token, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    ValidationError: { description: schema validation failed; body lists errors, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    NotFound: { description: not found, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties: { error: { type: string }, details: { type: array, items: { type: string } } }
+    IncidentSummary:
+      type: object
+      required: [incident_id, incident_version, endpoint_id, os, status, severity, confidence, title, detected_at_utc, technique_ids, correlation_summary]
+      properties:
+        incident_id: { type: string }
+        incident_version: { type: integer }
+        endpoint_id: { type: string }
+        os: { type: string }
+        status: { type: string }
+        severity: { type: string }
+        confidence: { type: string }
+        title: { type: string }
+        detected_at_utc: { type: string }
+        technique_ids: { type: array, items: { type: string } }
+        correlation_summary: { type: object, properties: { matched: { type: integer }, ambiguous: { type: integer }, pending: { type: integer }, unmatched: { type: integer }, ml_suspicious: { type: integer } } }
+        local_response_status: { type: string }
+    EndpointStatus:
+      type: object
+      properties:
+        endpoint_id: { type: string }
+        os: { type: string }
+        ip_addresses: { type: array, items: { type: string } }
+        last_heartbeat_utc: { type: string }
+        clock_offset_ms: { type: number }
+        sensor_status: { type: string }
+        agent_version: { type: string }
+        dry_run: { type: boolean }
+    NetworkAlert:
+      type: object
+      properties:
+        alert_id: { type: string }
+        flow: { $ref: "schemas/flow_record.schema.json" }
+        gateway_connection_id: { type: string }
+        created_utc: { type: string }
+        incident_id: { type: [string, "null"] }

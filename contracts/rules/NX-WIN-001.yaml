@@ -1,0 +1,33 @@
+id: NX-WIN-001
+version: "1.0"
+title: PowerShell with bypass/encoded flags stages a file and connects outbound
+kind: sequence
+os: [windows]
+severity: high
+technique_ids: [T1059.001, T1074.001, T1105]
+references:
+  - "sigma: proc_creation_win_powershell_encoded_cmd / executionpolicy_bypass (ported logic)"
+window_seconds: 60
+ordered: true
+context:
+  max_ancestors: 3
+  max_descendant_depth: 3
+  incident_window_seconds: 120
+steps:
+  - step: ps
+    event_type: process_start
+    where:
+      binary: { endswith_any: ["\\powershell.exe", "\\pwsh.exe"] }
+      command_line: { contains_any: ["-enc", "-encodedcommand", "-executionpolicy bypass", "-ep bypass"] }
+  - step: stage
+    event_type: file_access
+    where:
+      file.operation: { in: [create, write] }
+      file.path: { prefix_any: ["C:\\Lab\\staging\\"] }
+    lineage: { relation: descendant_of, of: ps, max_depth: 2, include_self: true }
+  - step: net
+    event_type: network_connect
+    where:
+      network.direction: { equals: outbound }
+      network.dst_ip: { not_in_cidr: ["127.0.0.0/8", "192.168.20.1/32"] }
+    lineage: { relation: descendant_of, of: ps, max_depth: 2, include_self: true }

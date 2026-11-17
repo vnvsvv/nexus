@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/flow_record.schema.json",
+  "title": "FlowRecord",
+  "description": "A bidirectional flow extracted by NFStream on a gateway interface, with nf-lite-1 features and the ML prediction.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["flow_id", "capture_interface", "protocol", "src_ip", "src_port", "dst_ip", "dst_port", "first_seen_utc", "last_seen_utc", "feature_version", "features"],
+  "properties": {
+    "flow_id": { "type": "string", "pattern": "^gw:flow-[0-9A-Za-z-]+$" },
+    "gateway_connection_id": { "type": ["string", "null"] },
+    "duplicate_of": { "type": ["string", "null"] },
+    "capture_interface": { "type": "string" },
+    "protocol": { "type": "integer", "description": "IP protocol number (6 TCP, 17 UDP, 1 ICMP)" },
+    "src_ip": { "type": "string" }, "src_port": { "type": "integer" },
+    "dst_ip": { "type": "string" }, "dst_port": { "type": "integer" },
+    "first_seen_utc": { "type": "string", "format": "date-time" },
+    "last_seen_utc": { "type": "string", "format": "date-time" },
+    "application_name": { "type": ["string", "null"], "description": "NFStream nDPI label, display only" },
+    "feature_version": { "const": "nf-lite-1" },
+    "features": { "$ref": "#/$defs/nf_lite_1" },
+    "ml": { "$ref": "ml_prediction.schema.json" },
+    "scope": { "enum": ["routed", "gateway-internal"], "default": "routed" }
+  },
+  "$defs": {
+    "nf_lite_1": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "l4_dst_port", "in_bytes", "out_bytes", "in_pkts", "out_pkts", "flow_duration_ms", "duration_in_ms", "duration_out_ms", "tcp_flags", "client_tcp_flags", "server_tcp_flags", "longest_flow_pkt", "shortest_flow_pkt", "mean_pkt_size", "src_to_dst_second_bytes", "dst_to_src_second_bytes", "src_to_dst_avg_throughput", "dst_to_src_avg_throughput", "num_pkts_up_to_128_bytes", "num_pkts_128_to_256_bytes", "num_pkts_256_to_512_bytes", "num_pkts_512_to_1024_bytes", "num_pkts_1024_to_1514_bytes"],
+      "properties": {
+        "protocol": { "type": "integer" },
+        "l4_dst_port": { "type": "integer" },
+        "in_bytes": { "type": "integer" }, "out_bytes": { "type": "integer" },
+        "in_pkts": { "type": "integer" }, "out_pkts": { "type": "integer" },
+        "flow_duration_ms": { "type": "integer" },
+        "duration_in_ms": { "type": "integer" }, "duration_out_ms": { "type": "integer" },
+        "tcp_flags": { "type": "integer", "description": "bitmask FIN=1 SYN=2 RST=4 PSH=8 ACK=16 URG=32 ECE=64 CWR=128, cumulative both directions" },
+        "client_tcp_flags": { "type": "integer" }, "server_tcp_flags": { "type": "integer" },
+        "longest_flow_pkt": { "type": "integer" }, "shortest_flow_pkt": { "type": "integer" },
+        "mean_pkt_size": { "type": "number" },
+        "src_to_dst_second_bytes": { "type": "number" }, "dst_to_src_second_bytes": { "type": "number" },
+        "src_to_dst_avg_throughput": { "type": "number" }, "dst_to_src_avg_throughput": { "type": "number" },
+        "num_pkts_up_to_128_bytes": { "type": "integer" },
+        "num_pkts_128_to_256_bytes": { "type": "integer" },
+        "num_pkts_256_to_512_bytes": { "type": "integer" },
+        "num_pkts_512_to_1024_bytes": { "type": "integer" },
+        "num_pkts_1024_to_1514_bytes": { "type": "integer" }
+      }
+    }
+  }
+}

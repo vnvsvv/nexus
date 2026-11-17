@@ -1,0 +1,20 @@
+# Rule -> MITRE ATT&CK mapping (v1). The incident builder uses ONLY this file (via rule.technique_ids); never per-event guesses.
+# Names included for the dashboard. Verify names against https://attack.mitre.org/ before the report.
+techniques:
+  T1059.001: { tactic: Execution, name: "Command and Scripting Interpreter: PowerShell" }
+  T1059.004: { tactic: Execution, name: "Command and Scripting Interpreter: Unix Shell" }
+  T1204.002: { tactic: Execution, name: "User Execution: Malicious File" }
+  T1005:     { tactic: Collection, name: "Data from Local System" }
+  T1074.001: { tactic: Collection, name: "Data Staged: Local Data Staging" }
+  T1041:     { tactic: Exfiltration, name: "Exfiltration Over C2 Channel" }
+  T1105:     { tactic: Command and Control, name: "Ingress Tool Transfer" }
+  T1071:     { tactic: Command and Control, name: "Application Layer Protocol" }
+  T1046:     { tactic: Discovery, name: "Network Service Discovery" }
+rules:
+  NX-LIN-001: [T1059.004, T1005, T1041]
+  NX-LIN-002: [T1046]
+  NX-LIN-003: [T1204.002, T1071]
+  NX-WIN-001: [T1059.001, T1074.001, T1105]
+  NX-WIN-002: [T1204.002]
+  NX-WIN-003: [T1046]
+  NX-ANY-001: [T1204.002]

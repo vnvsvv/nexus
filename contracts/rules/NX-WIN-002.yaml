@@ -1,0 +1,20 @@
+id: NX-WIN-002
+version: "1.0"
+title: Lab test binary under C:\Lab\bin executes (automatic response demo)
+kind: single
+os: [windows]
+severity: high
+technique_ids: [T1204.002]
+window_seconds: 1
+context:
+  max_ancestors: 2
+  max_descendant_depth: 1
+  incident_window_seconds: 60
+steps:
+  - step: bin
+    event_type: process_start
+    where:
+      binary: { prefix_any: ["C:\\Lab\\bin\\"] }
+response:
+  action: terminate_process
+  target_step: bin

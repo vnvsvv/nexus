@@ -1,0 +1,4 @@
+type,value,tags
+ip_port,192.168.20.10:8443,lab-test;scenario-l1
+ip_port,192.168.10.10:8080,lab-test;scenario-w1
+sha256,275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f,lab-test;eicar

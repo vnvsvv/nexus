@@ -1,0 +1,21 @@
+id: NX-LIN-002
+version: "1.0"
+title: One process connects to many distinct destination ports on one host (scan-like behaviour)
+kind: threshold
+os: [linux]
+severity: medium
+technique_ids: [T1046]
+references:
+  - "elastic: network_connection_sweep style logic, adapted to per-process counting"
+context:
+  max_ancestors: 2
+  max_descendant_depth: 1
+  incident_window_seconds: 120
+threshold:
+  event_type: network_connect
+  where: { network.direction: { equals: outbound } }
+  scope: process
+  distinct_field: network.dst_port
+  group_by: network.dst_ip
+  min_distinct: 15
+  window_seconds: 10

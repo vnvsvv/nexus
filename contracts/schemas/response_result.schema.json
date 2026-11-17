@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/response_result.schema.json",
+  "title": "ResponseResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["command_id", "executed_utc", "status", "executor", "detail"],
+  "properties": {
+    "command_id": { "type": "string" },
+    "executed_utc": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["executed", "dry_run", "denied", "failed"] },
+    "executor": { "type": "string", "description": "endpoint_id or 'gateway'" },
+    "detail": {
+      "type": "object", "additionalProperties": true,
+      "properties": {
+        "reason": { "type": "string" },
+        "pid": { "type": "integer" },
+        "binary": { "type": "string" },
+        "block_id": { "type": "string" },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

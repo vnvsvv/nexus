@@ -1,0 +1,11 @@
+{
+  "command_id": "cmd-0001",
+  "executed_utc": "2026-11-15T10:30:31.000Z",
+  "status": "denied",
+  "executor": "linux-vm-01",
+  "detail": {
+    "reason": "not allowlisted",
+    "pid": 4215,
+    "binary": "/usr/bin/curl"
+  }
+}

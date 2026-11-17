@@ -1,0 +1,37 @@
+id: NX-LIN-001
+version: "1.0"
+title: Script interpreter spawns shell that reads a protected file and connects outbound
+kind: sequence
+os: [linux]
+severity: high
+technique_ids: [T1059.004, T1005, T1041]
+references:
+  - "sigma: proc_creation_lnx_susp_shell_from_script_interpreter (ported logic)"
+window_seconds: 60
+ordered: true
+context:
+  max_ancestors: 3
+  max_descendant_depth: 3
+  incident_window_seconds: 120
+steps:
+  - step: interp
+    event_type: process_start
+    where:
+      binary: { endswith_any: ["/python3", "/python3.12", "/python3.11", "/python", "/perl", "/node"] }
+  - step: shell
+    event_type: process_start
+    where:
+      binary: { endswith_any: ["/bash", "/sh", "/dash", "/zsh"] }
+    lineage: { relation: descendant_of, of: interp, max_depth: 2 }
+  - step: read
+    event_type: file_access
+    where:
+      file.operation: { equals: read }
+      file.path: { prefix_any: ["/lab/protected/"] }
+    lineage: { relation: descendant_of, of: shell, max_depth: 2, include_self: true }
+  - step: net
+    event_type: network_connect
+    where:
+      network.direction: { equals: outbound }
+      network.dst_ip: { not_in_cidr: ["127.0.0.0/8"] }
+    lineage: { relation: descendant_of, of: shell, max_depth: 2, include_self: true }

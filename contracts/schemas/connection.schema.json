@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/connection.schema.json",
+  "title": "HostConnection",
+  "description": "Process-linked network connection reported inside an incident. One per network_connect evidence event.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["connection_id", "process_instance_id", "protocol", "src_ip", "src_port", "dst_ip", "dst_port", "direction", "first_seen_utc", "evidence_event_ids"],
+  "properties": {
+    "connection_id": { "type": "string", "pattern": "^conn-[0-9A-Za-z-]+$" },
+    "process_instance_id": { "type": "string" },
+    "protocol": { "enum": ["TCP", "UDP"] },
+    "src_ip": { "type": "string" },
+    "src_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "dst_ip": { "type": "string" },
+    "dst_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "direction": { "enum": ["outbound", "inbound"] },
+    "first_seen_utc": { "type": "string", "format": "date-time" },
+    "last_seen_utc": { "type": ["string", "null"], "format": "date-time" },
+    "evidence_event_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+  }
+}

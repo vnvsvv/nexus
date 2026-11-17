@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/response_command.schema.json",
+  "title": "ResponseCommand",
+  "description": "Closed set of actions. Endpoints poll for commands addressed to them; the gateway executes gateway-kind commands itself. No free-form commands exist.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["command_id", "target_kind", "action", "params", "requested_by", "created_utc", "dry_run"],
+  "properties": {
+    "command_id": { "type": "string", "pattern": "^cmd-[0-9A-Za-z-]+$" },
+    "target_kind": { "enum": ["endpoint", "gateway"] },
+    "endpoint_id": { "type": ["string", "null"] },
+    "incident_id": { "type": ["string", "null"] },
+    "action": { "enum": ["terminate_process", "block_connection", "block_destination", "unblock"] },
+    "params": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "process_instance_id": { "type": "string" },
+        "pid": { "type": "integer" },
+        "binary": { "type": "string" },
+        "protocol": { "enum": ["TCP", "UDP"] },
+        "src_ip": { "type": "string" }, "src_port": { "type": "integer" },
+        "dst_ip": { "type": "string" }, "dst_port": { "type": "integer" },
+        "timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400 },
+        "block_id": { "type": "string" }
+      }
+    },
+    "requested_by": { "type": "string", "description": "'rule:<rule_id>' for automatic, 'user:<name>' for manual" },
+    "created_utc": { "type": "string", "format": "date-time" },
+    "dry_run": { "type": "boolean" },
+    "status": { "enum": ["queued", "delivered", "completed", "expired"] }
+  }
+}

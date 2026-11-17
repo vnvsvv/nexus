@@ -1,0 +1,17 @@
+id: NX-ANY-001
+version: "1.0"
+title: Process started from a binary whose SHA-256 is on the local threat-intelligence hash list
+kind: single
+os: [linux, windows]
+severity: critical
+technique_ids: [T1204.002]
+window_seconds: 1
+context:
+  max_ancestors: 3
+  max_descendant_depth: 2
+  incident_window_seconds: 120
+steps:
+  - step: bin
+    event_type: process_start
+    where:
+      attributes.ti_hash_hit: { equals: true }   # set by the agent when sha256 is in the list fetched from GET /ti/hashes

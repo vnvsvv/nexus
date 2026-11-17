@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nexus.local/schemas/incident.schema.json",
+  "title": "Incident",
+  "description": "Preliminary incident produced by an endpoint (versioned). The server stores it verbatim and adds a separate 'server' block (see server_incident_view.schema.json). Endpoints never populate 'server'.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "incident_id", "incident_version", "endpoint_id", "os", "status", "detected_at_utc", "updated_at_utc", "severity", "confidence", "rule_matches", "technique_ids", "root_process_instance_id", "process_nodes", "relationships", "evidence", "connections", "gaps", "local_response"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "incident_id": { "type": "string", "pattern": "^[a-z0-9-]+:INC-[0-9A-Za-z-]+$", "description": "<endpoint_id>:INC-<ULID or yyyymmddThhmmss-seq>" },
+    "incident_version": { "type": "integer", "minimum": 1 },
+    "endpoint_id": { "type": "string" },
+    "os": { "enum": ["linux", "windows"] },
+    "status": { "enum": ["open", "closed"] },
+    "detected_at_utc": { "type": "string", "format": "date-time" },
+    "updated_at_utc": { "type": "string", "format": "date-time" },
+    "severity": { "enum": ["low", "medium", "high", "critical"] },
+    "confidence": { "enum": ["low", "medium", "high"] },
+    "title": { "type": "string", "maxLength": 200 },
+    "rule_matches": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["rule_id", "matched_at_utc", "bindings"],
+        "properties": {
+          "rule_id": { "type": "string" },
+          "rule_version": { "type": "string" },
+          "matched_at_utc": { "type": "string", "format": "date-time" },
+          "bindings": { "type": "object", "additionalProperties": { "type": "string" }, "description": "step name -> event_id" }
+        }
+      }
+    },
+    "technique_ids": { "type": "array", "items": { "type": "string", "pattern": "^T[0-9]{4}(\\.[0-9]{3})?$" }, "uniqueItems": true },
+    "root_process_instance_id": { "type": "string" },
+    "process_nodes": {
+      "type": "array", "minItems": 1, "maxItems": 50,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["process_instance_id", "pid", "binary"],
+        "properties": {
+          "process_instance_id": { "type": "string" },
+          "parent_process_instance_id": { "type": ["string", "null"] },
+          "pid": { "type": "integer" },
+          "binary": { "type": "string" },
+          "command_line": { "type": ["string", "null"] },
+          "user": { "type": ["string", "null"] },
+          "sha256": { "type": ["string", "null"] },
+          "start_time_utc": { "type": ["string", "null"], "format": "date-time" },
+          "end_time_utc": { "type": ["string", "null"], "format": "date-time" },
+          "placeholder": { "type": "boolean", "default": false },
+          "role": { "enum": ["root", "matched", "context"] }
+        }
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["type", "from", "to", "basis", "evidence_event_ids"],
+        "properties": {
+          "type": { "enum": ["PARENT_OF", "ACCESSED_FILE", "CONNECTED_TO", "RESOLVED"] },
+          "from": { "type": "string", "description": "process_instance_id" },
+          "to": { "type": "string", "description": "process_instance_id | file:<path> | net:<ip>:<port>/<proto> | dns:<name>" },
+          "basis": { "enum": ["observed", "inferred"] },
+          "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
+          "note": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array", "maxItems": 200,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["event_id", "role", "event"],
+        "properties": {
+          "event_id": { "type": "string" },
+          "role": { "enum": ["matched", "context"] },
+          "event": { "$ref": "host_event.schema.json" }
+        }
+      }
+    },
+    "connections": {
+      "type": "array",
+      "items": { "$ref": "connection.schema.json" }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "enum": ["PARENT_NOT_OBSERVED", "FILE_READ_NOT_OBSERVABLE_ON_WINDOWS", "EVIDENCE_TRUNCATED", "PROCESS_SET_TRUNCATED", "IDENTITY_INFERRED", "SENSOR_EVENT_LOSS", "NO_GATEWAY_RECORD", "OTHER"] },
+          "message": { "type": "string" },
+          "related": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "local_response": {
+      "type": "object", "additionalProperties": false,
+      "required": ["action", "status"],
+      "properties": {
+        "action": { "enum": ["none", "terminate_process"] },
+        "status": { "enum": ["not_requested", "dry_run", "executed", "denied", "failed"] },
+        "target_process_instance_id": { "type": ["string", "null"] },
+        "command_id": { "type": ["string", "null"] },
+        "detail": { "type": ["string", "null"] }
+      }
+    },
+    "related_incident_ids": { "type": "array", "items": { "type": "string" } },
+    "agent_version": { "type": "string" }
+  }
+}

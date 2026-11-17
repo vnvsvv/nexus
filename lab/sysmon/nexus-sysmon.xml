@@ -1,0 +1,81 @@
+<!--
+  NEXUS Sysmon configuration (lab VM). Install:  Sysmon64.exe -accepteula -i nexus-sysmon.xml
+  Update:  Sysmon64.exe -c nexus-sysmon.xml      Verify: Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 5
+  Design: enable the events NEXUS consumes (1, 3, 5, 11, 22, 23), SHA256 hashes, and exclude the noisiest system sources.
+  Start minimal; widen only when the adapter proves stable. Compare later with sysmon-modular (Olaf Hartong) if you need more coverage.
+-->
+<Sysmon schemaversion="4.90">
+  <HashAlgorithms>SHA256</HashAlgorithms>
+  <CheckRevocation>False</CheckRevocation>
+  <DnsLookup>False</DnsLookup>
+  <EventFiltering>
+
+    <!-- 1: Process creation — log everything except the loudest system noise -->
+    <RuleGroup name="ProcessCreate" groupRelation="or">
+      <ProcessCreate onmatch="exclude">
+        <Image condition="is">C:\Windows\System32\conhost.exe</Image>
+        <Image condition="is">C:\Windows\System32\SearchFilterHost.exe</Image>
+        <Image condition="is">C:\Windows\System32\SearchProtocolHost.exe</Image>
+        <Image condition="begin with">C:\Windows\System32\wbem\WmiPrvSE.exe</Image>
+        <ParentImage condition="is">C:\Windows\System32\svchost.exe</ParentImage>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- 3: Network connections — log everything except local/loopback and the agent's own traffic -->
+    <RuleGroup name="NetworkConnect" groupRelation="or">
+      <NetworkConnect onmatch="exclude">
+        <DestinationIp condition="is">127.0.0.1</DestinationIp>
+        <DestinationIp condition="begin with">fe80:</DestinationIp>
+        <DestinationIp condition="is">::1</DestinationIp>
+        <Image condition="is">C:\Windows\System32\svchost.exe</Image>
+      </NetworkConnect>
+    </RuleGroup>
+
+    <!-- 5: Process termination -->
+    <RuleGroup name="ProcessTerminate" groupRelation="or">
+      <ProcessTerminate onmatch="exclude" />
+    </RuleGroup>
+
+    <!-- 11: File create — lab paths and common staging locations -->
+    <RuleGroup name="FileCreate" groupRelation="or">
+      <FileCreate onmatch="include">
+        <TargetFilename condition="begin with">C:\Lab\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Public\</TargetFilename>
+        <TargetFilename condition="contains">\AppData\Local\Temp\</TargetFilename>
+        <TargetFilename condition="end with">.ps1</TargetFilename>
+        <TargetFilename condition="end with">.exe</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+
+    <!-- 22: DNS queries -->
+    <RuleGroup name="DnsQuery" groupRelation="or">
+      <DnsQuery onmatch="exclude">
+        <QueryName condition="end with">.in-addr.arpa</QueryName>
+        <QueryName condition="end with">.microsoft.com</QueryName>
+        <QueryName condition="end with">.windowsupdate.com</QueryName>
+      </DnsQuery>
+    </RuleGroup>
+
+    <!-- 23: File delete (archived) — lab paths only -->
+    <RuleGroup name="FileDelete" groupRelation="or">
+      <FileDelete onmatch="include">
+        <TargetFilename condition="begin with">C:\Lab\</TargetFilename>
+      </FileDelete>
+    </RuleGroup>
+
+    <!-- Everything else off for v1 -->
+    <RuleGroup name="Off" groupRelation="or">
+      <ImageLoad onmatch="include" />
+      <CreateRemoteThread onmatch="include" />
+      <RawAccessRead onmatch="include" />
+      <ProcessAccess onmatch="include" />
+      <RegistryEvent onmatch="include" />
+      <FileCreateStreamHash onmatch="include" />
+      <PipeEvent onmatch="include" />
+      <WmiEvent onmatch="include" />
+      <ClipboardChange onmatch="include" />
+      <ProcessTampering onmatch="include" />
+      <FileDeleteDetected onmatch="include" />
+    </RuleGroup>
+  </EventFiltering>
+</Sysmon>
