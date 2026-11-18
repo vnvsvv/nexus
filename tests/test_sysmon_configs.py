@@ -59,18 +59,21 @@ def test_dev_privacy_regressions_are_caught(tmp_path, old, new, needle):
 
 def test_non_ascii_and_missing_marker_and_schema_are_caught(tmp_path):
     assert any("non-ASCII" in e for e in lint.lint(_mutate(tmp_path, DEV, "EID 1   process", "EID 1 \u2014 process"), "dev"))
-    no_marker = tmp_path / "nomarker-dev.xml"
-    no_marker.write_text(DEV.read_text().replace("UNVALIDATED", "checked"))
-    assert any("UNVALIDATED" in e for e in lint.lint(no_marker, "dev"))
-    both = tmp_path / "both-dev.xml"
-    both.write_text(DEV.read_text().replace("UNVALIDATED.", "UNVALIDATED. VALIDATED 2026-12-01.", 1))
-    assert any("exactly one" in e for e in lint.lint(both, "dev"))
-    # after real validation the marker is replaced by a dated one, and lint must still pass
-    done = tmp_path / "done-dev.xml"
-    done.write_text(DEV.read_text().replace("UNVALIDATED", "VALIDATED 2026-12-01"))
-    assert lint.lint(done, "dev") == []
+    # marker tests do not depend on which marker the shipped file currently has
+    bare = re.sub(r"\bUNVALIDATED\b|(?<![A-Za-z])VALIDATED \d{4}-\d{2}-\d{2}", "checked", DEV.read_text())
+    for name, marker, ok in [("nomarker", "", False), ("both", "UNVALIDATED VALIDATED 2026-12-01", False),
+                             ("unvalidated", "UNVALIDATED", True), ("validated", "VALIDATED 2026-12-01", True)]:
+        p = tmp_path / f"{name}-dev.xml"
+        p.write_text(bare.replace("STATUS: ", f"STATUS: {marker} ", 1))
+        errs = lint.lint(p, "dev")
+        assert (errs == []) if ok else any("exactly one" in e and "UNVALIDATED" in e for e in errs), (name, errs)
     assert any("schemaversion" in e for e in lint.lint(_mutate(tmp_path, DEV, 'schemaversion="4.91"', 'schemaversion="4.90"'), "dev"))
     assert any("groupRelation" in e for e in lint.lint(_mutate(tmp_path, DEV, '<RuleGroup name="DnsQuery" groupRelation="or">', '<RuleGroup name="DnsQuery">'), "dev"))
+
+
+def test_shipped_marker_state():
+    assert re.search(r"(?<![A-Za-z])VALIDATED 2026-11-18\b", DEV.read_text().split("-->", 1)[0])
+    assert re.search(r"\bUNVALIDATED\b", LAB.read_text().split("-->", 1)[0])  # lab VM profile not yet verified
 
 
 def test_lab_decisions_are_caught(tmp_path):

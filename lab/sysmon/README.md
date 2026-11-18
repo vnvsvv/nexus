@@ -1,12 +1,14 @@
 # Sysmon for NEXUS: laptop development profile and lab VM profile
 
-> **Status: nothing in this folder has been validated on a real Windows installation.** The two configs
-> were written from Microsoft's documentation and general Sysmon knowledge, checked only for XML
-> well-formedness and the static rules in `tools/lint_sysmon_config.py`. Treat the first install as an
-> experiment: run the pre-install checks, install, run the verification matrix, and uninstall if anything
-> unexpected is logged. When a config has passed the matrix on a real machine, replace the word
-> `UNVALIDATED` in its header comment with `VALIDATED YYYY-MM-DD` (lint requires exactly one of the
-> two) and note the date in `STATUS.md`.
+> **Status.** The dev laptop profile (`nexus-sysmon-dev.xml`) is **`VALIDATED 2026-11-18`** on a physical
+> Windows 11 laptop with Sysmon 15.22 (schema 4.91); §3.3 records what was and was not verified. The lab
+> VM profile (`nexus-sysmon.xml`) has **not** been loaded by a real Sysmon and stays `UNVALIDATED`. Both
+> configs were written from Microsoft's documentation and general Sysmon knowledge and are also checked
+> statically by `tools/lint_sysmon_config.py` (which does not prove Sysmon accepts a file). Treat the lab
+> profile's first install as an experiment: run the pre-install checks, install, run the verification
+> matrix, and uninstall if anything unexpected is logged. When it has passed on a real machine, replace
+> `UNVALIDATED` in its header comment with `VALIDATED YYYY-MM-DD` (lint requires exactly one of the two)
+> and note the date in `STATUS.md`.
 
 Facts this README relies on (from Microsoft's Sysmon page, v15.22): all filter conditions are
 case-insensitive; rules on the same field are ORed and rules on different fields are ANDed unless a
@@ -115,6 +117,32 @@ wevtutil cl "Microsoft-Windows-Sysmon/Operational"   # may say the channel no lo
 ```
 Do not use `Sysmon64.exe -c --`: that resets to Sysmon's built-in defaults, which log far more than this profile.
 If `C:\Sysmon` exists and is empty but cannot be deleted (SYSTEM-only ACL), leave it.
+
+### 3.3 Verification record: dev profile, 2026-11-18
+Run by Anas on the physical laptop (Windows 11, Sysmon 15.22, schema 4.91). `Sysmon64.exe -c` showed the
+intended dev profile and no EID 23 events or `C:\Sysmon` folder appeared. Raw logs are not stored in this
+repository; only the outcomes below are.
+
+| Row | Result |
+|---|---|
+| P1 | Pass: EID 1 and EID 5 for `cmd.exe` with the `NEXUS_TEST` marker. |
+| P2 | Pass: EID 11 and EID 26 for a file under `C:\Lab\`. |
+| P3 | Pass: EID 22 for `probe.nexus.test`. |
+| P4 | Pass: W1 run with a temporary own-IP-only receiver (not in the repository; it discarded the upload). EID 1 for `cmd.exe`, `powershell.exe` and `python.exe`; EID 3 `powershell.exe` to port 8080 with `Initiated=true`; EID 3 `python.exe` on port 8080 with `Initiated=false`; EID 5 for all three; EID 11 for `report.zip` and for the `staging` and `manifests` directories. The receiver took one 153-byte upload and its SHA-256 matched the local `report.zip`. |
+| N2, N3, N4, N5 | Pass: no EID 3 for HTTPS (port 443), no EID 22 for `example.com`, no EID 11 for a temp file outside `C:\Lab\`, no EID 1 for Notepad. |
+| N1 | **Partial**: no EID 1 or EID 3 for Edge, but already-running browser processes may have been reused, so a freshly started browser was not conclusively tested. |
+| H | Pass: only Ids 1, 3, 4, 5, 11, 16, 22 and 26 appeared. A per-image count of EID 5 events showed only PowerShell and CMD before P4, and `python.exe` was added by P4. |
+
+Notes:
+- The EID 11 events for `C:\Lab\staging` and `C:\Lab\manifests` are for the **directories** being created.
+  The profile excludes paths that begin with `C:\Lab\manifests\`, so the manifest JSON file inside that
+  folder is not expected in the log, and whether it appeared was not examined.
+- Both ends of the W1 connection are on the laptop, so the `Initiated=false` event does not show which
+  address is local for a connection that really arrives from another host (open question O1).
+
+Not verified: **reboot persistence** (that the Sysmon service and this profile come back after a restart),
+**cross-host inbound direction** (O1), and a **freshly started browser** (N1). The lab VM profile has not
+been loaded at all.
 
 ## 4. Lab VM: lab profile
 

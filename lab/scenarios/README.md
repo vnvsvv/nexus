@@ -24,3 +24,5 @@ Only for adapter development; evaluation numbers still come from the lab VM. Aft
 3. `$env:NEXUS_TARGET = '<your LAN IP>'` then `cmd /c powershell -ExecutionPolicy Bypass -File C:\Lab\scenarios\w1_stage.ps1`.
 
 Use your LAN IP, not `127.0.0.1`: the dev profile excludes loopback and NX-WIN-001 ignores `127.0.0.0/8`. Use a port other than 80 or 443. Expect a medium-confidence incident with a `PARENT_NOT_OBSERVED` gap, because the parent of `cmd` (your terminal) was never logged by EID 1 and is a placeholder. The python receiver is a separate process and not part of the W1 incident.
+
+Verified on the laptop on 2026-11-18 (record in `lab/sysmon/README.md` §3.3). Caution: on a Public Wi-Fi network with an existing inbound allow rule for `python.exe`, a receiver bound to your LAN IP is reachable by other devices on that network while it runs. Run W1 only on a trusted network, keep `C:\Lab\receiver` empty, stop the receiver as soon as the upload arrives, and prefer a receiver that accepts only your own IP and discards the upload (the stock `http.server` answers `501` to the POST, which the script ignores).

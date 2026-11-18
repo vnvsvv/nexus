@@ -54,8 +54,9 @@ On the gateway, record `conntrack -E -e NEW -o timestamp` to a file. On the Linu
 | Sysmon EID 11 for `C:\Lab\staging\*` | | | |
 | Sysmon EID 26 for a deleted `C:\Lab\` file; EID 23 absent | | | |
 | No Sysmon EID 3 to 192.168.20.1 while the agent posts; no EID 22 for `nexus-server`; no EID 11 for `C:\Lab\manifests\*` | | | |
-| Sysmon EID 3 with `Initiated=false`: which address is local (open question O1) | | | |
-| Both Sysmon configs loaded by a real Sysmon; `UNVALIDATED` replaced by `VALIDATED YYYY-MM-DD` in their headers | | | |
+| Sysmon EID 3 with `Initiated=false`: which address is local (open question O1) | Not determinable on the dev laptop (both ends were the same host); needs a cross-host run on the lab VMs | | |
+| Dev Sysmon config loaded by a real Sysmon; header says `VALIDATED YYYY-MM-DD` | Loaded; matrix passed with limits (N1 partial, no reboot test): `lab/sysmon/README.md` §3.3 | 2026-11-18 | Anas |
+| Lab Sysmon config (`nexus-sysmon.xml`) loaded on `windows-vm-01`; `UNVALIDATED` replaced by `VALIDATED YYYY-MM-DD` | | | |
 | conntrack NEW within 50 ms of host connect | | | |
 | NFStream flow emitted ≤ 20 s after connection end (idle 15) | | | |
 | `nf-lite-1` direction convention confirmed | | | |

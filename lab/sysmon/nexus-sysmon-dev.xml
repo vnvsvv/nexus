@@ -1,12 +1,13 @@
 <!--
   NEXUS Sysmon configuration - DEV LAPTOP profile (Sysmon 15.x, config schema 4.91)
 
-  STATUS: UNVALIDATED. This file was written without access to a real Windows installation and has
-  never been loaded by a real Sysmon. Review it, run the pre-install checks and the verification
-  matrix in lab/sysmon/README.md, and uninstall if anything unexpected is logged.
-  When it has been verified on a real machine, replace the word UNVALIDATED in this comment with
-  VALIDATED YYYY-MM-DD (tools/lint_sysmon_config.py requires exactly one of the two) and record the
-  date in STATUS.md.
+  STATUS: VALIDATED 2026-11-18 on a physical Windows 11 laptop with Sysmon 15.22 (schema 4.91).
+  It was loaded with Sysmon64.exe -i, Sysmon64.exe -c showed this profile, and the verification
+  matrix in lab/sysmon/README.md section 3.1 passed (rows P1 to P4, N2 to N5 and H). Known limits:
+  row N1 (browser) was only partly demonstrated, reboot persistence was not tested, and which address
+  is local in an inbound EID 3 (Initiated=false) from another host is unverified. Details are in
+  README section 3.3. If this file is edited, re-run the matrix and change the date.
+  (tools/lint_sysmon_config.py requires exactly one status marker in this header comment.)
 
   PURPOSE: let one developer test the NEXUS Windows adapter on a personal laptop while logging
   almost nothing about what the person normally does. Everything is "include" based: an event is
