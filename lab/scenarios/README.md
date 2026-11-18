@@ -13,4 +13,16 @@ Every scenario script writes a **ground-truth manifest** (`/lab/manifests/<scena
 
 Run order for the final demo: L1 (story), W1 (cross-OS parity + gaps), L2 (automatic response), N1 (network-only + gateway block), L3 (threshold rule + many matches). Keep W2 as backup.
 
-Benign noise generator (`noise.sh` / `noise.ps1`): loops of `ls`, `grep`, package-manager metadata refresh, file copies under `/tmp` or `%TEMP%`, HTTP GETs to the other VM's web server, every 2–10 s, for the duration of an evaluation run. Expected: zero incidents.
+Benign noise generator (`noise.sh` / `noise.ps1`): loops of `ls`/`dir`, `grep`/`Select-String`, file copies and deletes in a work folder (`noise.ps1`: `C:\Lab\noise`, or `-WorkDir $env:TEMP\nexus-noise` for extra lab realism), HTTP GETs to the other VM's web server, an occasional DNS lookup of `noise.nexus.test`, every 2–10 s, for the duration of an evaluation run. Expected: zero incidents.
+
+`noise.ps1` (Windows PowerShell 5.1, unelevated, **not yet run on a real Windows machine**) writes `C:\Lab\manifests\NOISE-<start>.json` with `start_utc`, `end_utc`, `expected_incidents: 0` and counters, so `nexus-eval noise --window START END` can use it. It avoids `-ExecutionPolicy Bypass`, `-enc`, `C:\Lab\staging`, `C:\Lab\bin` and many-port connections so NX-WIN-001/002/003 stay quiet. Run: `Unblock-File C:\Lab\scenarios\noise.ps1; powershell -NoProfile -ExecutionPolicy RemoteSigned -File C:\Lab\scenarios\noise.ps1 -Minutes 60`. `noise.sh` still lacks the window manifest; Omar adds it in the same format.
+
+## W1 on the laptop (dev Sysmon profile)
+Only for adapter development; evaluation numbers still come from the lab VM. After the verification matrix in `lab/sysmon/README.md` has passed:
+1. Copy `w1_stage.ps1` to `C:\Lab\scenarios\` and put any harmless file in `C:\Lab\protected\`.
+2. Start a receiver whose command line mentions the lab folder (so the dev profile logs it): `python -m http.server 8080 --bind <your LAN IP> --directory C:\Lab\receiver`. If Windows Firewall asks, prefer Cancel; allow only for the Private profile and only temporarily if the connection fails.
+3. `$env:NEXUS_TARGET = '<your LAN IP>'` then `cmd /c powershell -ExecutionPolicy Bypass -File C:\Lab\scenarios\w1_stage.ps1`.
+
+Use your LAN IP, not `127.0.0.1`: the dev profile excludes loopback and NX-WIN-001 ignores `127.0.0.0/8`. Use a port other than 80 or 443. Expect a medium-confidence incident with a `PARENT_NOT_OBSERVED` gap, because the parent of `cmd` (your terminal) was never logged by EID 1 and is a placeholder. The python receiver is a separate process and not part of the W1 incident.
+
+Verified on the laptop on 2026-11-18 (record in `lab/sysmon/README.md` §3.3). Caution: on a Public Wi-Fi network with an existing inbound allow rule for `python.exe`, a receiver bound to your LAN IP is reachable by other devices on that network while it runs. Run W1 only on a trusted network, keep `C:\Lab\receiver` empty, stop the receiver as soon as the upload arrives, and prefer a receiver that accepts only your own IP and discards the upload (the stock `http.server` answers `501` to the POST, which the script ignores).

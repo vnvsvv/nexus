@@ -29,7 +29,7 @@ All rule IDs are also the `rule_ids` referenced by the fixtures and the evaluati
 |---|---|---|
 | process start/exit | base exec/exit events, `exec_id` | EID 1 / 5, `ProcessGuid` |
 | file read | `security_file_permission` kprobe (MAY_READ) on watched prefixes | **not available** → gap recorded; stretch: SACL + Security 4663 |
-| file create/write/delete | same kprobe (MAY_WRITE) / stretch: `security_path_unlink` | EID 11 (create), 23/26 (delete) |
+| file create/write/delete | same kprobe (MAY_WRITE) / stretch: `security_path_unlink` | EID 11 (create), 26 (delete; EID 23 stays off because it archives file copies) |
 | TCP connect (outbound) | `tcp_connect` kprobe with `sock` arg (5-tuple) | EID 3 `Initiated=true` |
 | TCP accept (inbound) | stretch: `inet_csk_accept` kretprobe | EID 3 `Initiated=false` |
 | UDP | stretch | EID 3 (udp) |

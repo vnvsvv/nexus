@@ -24,6 +24,7 @@ Rules:
 - A PID is never used as a key. It is stored for display and for fallback only.
 - `process_exit` closes a node (`end_time`); closed nodes are retained for `retention_seconds` (600) so late events (flows, exits of children) still attach.
 - Unknown parent → create a **placeholder node** (`binary: "<unknown>"`, `placeholder: true`) and record a `gap` ("parent process not observed; agent started after it").
+- Windows, sensor-filtered starts: on the laptop dev profile Sysmon logs EID 1 only for lab-related processes, so EID 3/11/22/26 can name a ProcessGuid that has no node. The adapter creates a placeholder node for it (`binary` from `Image`, `identity_resolution="placeholder"`); the incident gets `PARENT_NOT_OBSERVED`/`IDENTITY_INFERRED` and confidence at most `medium`. A `process_exit` for an unknown `process_instance_id` is ignored.
 - Agent start: Tetragon reports pre-existing processes with `flags: procFS`; Sysmon does not. The Windows adapter seeds the graph from `psutil.process_iter()` with `placeholder: true` so parents of later events resolve (basis `inferred`).
 
 ## 2. Endpoint graph

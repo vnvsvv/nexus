@@ -7,3 +7,10 @@ __pycache__/
 dist/
 node_modules/
 models/*/model.joblib
+
+# raw Windows event captures and private sample material must never be committed
+*.evtx
+samples-raw/
+nexus-samples-raw/
+deny.txt
+sysmon-schema*.txt

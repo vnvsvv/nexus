@@ -65,7 +65,7 @@ Rules:
 
 | Member | Dev machine | Needs lab? |
 |---|---|---|
-| Anas (8 GB, Windows) | Sysmon on his laptop; Python 3.11; mock server locally. Endpoint-core is pure Python. | Integration days only |
+| Anas (8 GB, Windows) | Sysmon **dev profile** (`nexus-sysmon-dev.xml`, `C:\Lab\` only) on his laptop; Python 3.11; mock server locally. Endpoint-core is pure Python. | Integration days only |
 | Omar (16 GB, RTX) | VirtualBox lab host #1 (gateway + Linux + Windows VMs). Develops the Linux adapter inside the Linux VM (or on a bare-metal Ubuntu if dual-booted). | Daily |
 | Rakan (16 GB) | VirtualBox lab host #2 (same OVAs). Develops the server inside the gateway VM. | Daily |
 | Bashar (6 GB) | Colab/Kaggle for training; Node 20 + Vite for the dashboard; mock server locally. | Integration days only |

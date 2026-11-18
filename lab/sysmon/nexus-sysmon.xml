@@ -1,16 +1,37 @@
 <!--
-  NEXUS Sysmon configuration (lab VM). Install:  Sysmon64.exe -accepteula -i nexus-sysmon.xml
-  Update:  Sysmon64.exe -c nexus-sysmon.xml      Verify: Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 5
-  Design: enable the events NEXUS consumes (1, 3, 5, 11, 22, 23), SHA256 hashes, and exclude the noisiest system sources.
-  Start minimal; widen only when the adapter proves stable. Compare later with sysmon-modular (Olaf Hartong) if you need more coverage.
+  NEXUS Sysmon configuration - LAB VM profile (windows-vm-01 only; Sysmon 15.x, config schema 4.91)
+  DO NOT INSTALL THIS ON A PERSONAL LAPTOP. It logs every process creation, every process exit,
+  most network connections and all DNS queries. Use lab/sysmon/nexus-sysmon-dev.xml on a laptop.
+
+  STATUS: UNVALIDATED. This file was written without access to a real Windows installation and has
+  never been loaded by a real Sysmon. Verify it on the lab VM with the matrix in lab/sysmon/README.md.
+  When it has been verified, replace the word UNVALIDATED in this comment with VALIDATED YYYY-MM-DD
+  (tools/lint_sysmon_config.py requires exactly one of the two) and record the date in STATUS.md.
+
+  Install: Sysmon64.exe -accepteula -i C:\ProgramData\nexus\nexus-sysmon.xml
+  Update:  Sysmon64.exe -c C:\ProgramData\nexus\nexus-sysmon.xml
+  (The config is copied outside C:\Lab so that installing it does not create lab-folder events.)
+  Verify:  Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 5
+
+  EVENTS USED BY NEXUS: 1, 3, 5, 11, 22, 26. EID 23 is off (it archives deleted files into C:\Sysmon).
+  EID 26 records that a lab file was deleted and does not keep a copy. No NEXUS rule uses deletes yet;
+  the events exist for evidence and for the telemetry coverage table in the report.
+
+  SELF-TRAFFIC: the agent talks to the gateway (192.168.20.1, or 192.168.10.1 if nexus-server resolves
+  through dnsmasq). All connections to those addresses are excluded so the agent does not observe
+  itself. NX-WIN-001 already ignores 192.168.20.1 for the same reason. Consequence: scenarios must not
+  target the gateway itself; they target linux-vm-01 (192.168.10.10).
+
+  CONVENTIONS: ASCII only, no double hyphen inside comments, every RuleGroup sets groupRelation
+  explicitly. "or" means a single matching rule is enough.
 -->
-<Sysmon schemaversion="4.90">
+<Sysmon schemaversion="4.91">
   <HashAlgorithms>SHA256</HashAlgorithms>
   <CheckRevocation>False</CheckRevocation>
   <DnsLookup>False</DnsLookup>
   <EventFiltering>
 
-    <!-- 1: Process creation — log everything except the loudest system noise -->
+    <!-- EID 1: log everything except the loudest system noise -->
     <RuleGroup name="ProcessCreate" groupRelation="or">
       <ProcessCreate onmatch="exclude">
         <Image condition="is">C:\Windows\System32\conhost.exe</Image>
@@ -21,22 +42,25 @@
       </ProcessCreate>
     </RuleGroup>
 
-    <!-- 3: Network connections — log everything except local/loopback and the agent's own traffic -->
+    <!-- EID 3: everything except loopback, link-local, svchost, and traffic to the gateway itself -->
     <RuleGroup name="NetworkConnect" groupRelation="or">
       <NetworkConnect onmatch="exclude">
-        <DestinationIp condition="is">127.0.0.1</DestinationIp>
-        <DestinationIp condition="begin with">fe80:</DestinationIp>
+        <DestinationIp condition="begin with">127.</DestinationIp>
         <DestinationIp condition="is">::1</DestinationIp>
+        <DestinationIp condition="is">0:0:0:0:0:0:0:1</DestinationIp>
+        <DestinationIp condition="begin with">fe80:</DestinationIp>
+        <DestinationIp condition="is">192.168.20.1</DestinationIp>
+        <DestinationIp condition="is">192.168.10.1</DestinationIp>
         <Image condition="is">C:\Windows\System32\svchost.exe</Image>
       </NetworkConnect>
     </RuleGroup>
 
-    <!-- 5: Process termination -->
+    <!-- EID 5: log all terminations (no rules means nothing is excluded) -->
     <RuleGroup name="ProcessTerminate" groupRelation="or">
       <ProcessTerminate onmatch="exclude" />
     </RuleGroup>
 
-    <!-- 11: File create — lab paths and common staging locations -->
+    <!-- EID 11: lab paths and common staging locations; manifests are ground truth, not evidence -->
     <RuleGroup name="FileCreate" groupRelation="or">
       <FileCreate onmatch="include">
         <TargetFilename condition="begin with">C:\Lab\</TargetFilename>
@@ -45,26 +69,39 @@
         <TargetFilename condition="end with">.ps1</TargetFilename>
         <TargetFilename condition="end with">.exe</TargetFilename>
       </FileCreate>
+      <FileCreate onmatch="exclude">
+        <TargetFilename condition="begin with">C:\Lab\manifests\</TargetFilename>
+      </FileCreate>
     </RuleGroup>
 
-    <!-- 22: DNS queries -->
+    <!-- EID 22: all DNS queries except reverse lookups, the agent's server name and Windows service noise -->
     <RuleGroup name="DnsQuery" groupRelation="or">
       <DnsQuery onmatch="exclude">
         <QueryName condition="end with">.in-addr.arpa</QueryName>
+        <QueryName condition="begin with">nexus-server</QueryName>
         <QueryName condition="end with">.microsoft.com</QueryName>
         <QueryName condition="end with">.windowsupdate.com</QueryName>
+        <QueryName condition="end with">.windows.com</QueryName>
+        <QueryName condition="end with">.msftconnecttest.com</QueryName>
       </DnsQuery>
     </RuleGroup>
 
-    <!-- 23: File delete (archived) — lab paths only -->
-    <RuleGroup name="FileDelete" groupRelation="or">
-      <FileDelete onmatch="include">
+    <!-- EID 26: delete detected under the lab folder, not archived -->
+    <RuleGroup name="FileDeleteDetected" groupRelation="or">
+      <FileDeleteDetected onmatch="include">
         <TargetFilename condition="begin with">C:\Lab\</TargetFilename>
-      </FileDelete>
+      </FileDeleteDetected>
     </RuleGroup>
 
-    <!-- Everything else off for v1 -->
+    <!-- EID 23 is OFF on purpose: it saves a copy of every matching deleted file under C:\Sysmon -->
+    <RuleGroup name="FileDelete" groupRelation="or">
+      <FileDelete onmatch="include" />
+    </RuleGroup>
+
+    <!-- Everything else is OFF: an include filter without rules logs nothing -->
     <RuleGroup name="Off" groupRelation="or">
+      <FileCreateTime onmatch="include" />
+      <DriverLoad onmatch="include" />
       <ImageLoad onmatch="include" />
       <CreateRemoteThread onmatch="include" />
       <RawAccessRead onmatch="include" />
@@ -75,7 +112,8 @@
       <WmiEvent onmatch="include" />
       <ClipboardChange onmatch="include" />
       <ProcessTampering onmatch="include" />
-      <FileDeleteDetected onmatch="include" />
+      <FileExecutableDetected onmatch="include" />
     </RuleGroup>
+
   </EventFiltering>
 </Sysmon>

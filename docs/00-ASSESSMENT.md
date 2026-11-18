@@ -30,7 +30,7 @@ Consuming raw kernel ETW providers (Kernel-Process, Kernel-Network, Kernel-File)
 
 **Decision:** Windows telemetry = **Sysmon, consumed through the Windows Event Log/ETW channel** via a push subscription. Raw ETW providers are a documented stretch goal. Report wording: "Windows telemetry via Sysmon (ETW-backed)". 
 
-**Consequence you must accept:** Sysmon does **not** log file *reads*. It logs creates (11), deletes (23/26), stream creation (15), executable detection (29). So the Windows demo scenario is "stage a file *into* a protected folder" (create/modify), not "read a secret". If a *read* is required on Windows, enable object-access auditing (SACL on `C:\Lab\protected`, Security Event 4663) — it gives PID but not ProcessGuid, so the agent must join by PID+time. Marked as stretch.
+**Consequence you must accept:** Sysmon does **not** log file *reads*. It logs creates (11), deletes (26 reports them; 23 also archives a copy of the file and is therefore off), stream creation (15), executable detection (29). So the Windows demo scenario is "stage a file *into* a protected folder" (create/modify), not "read a secret". If a *read* is required on Windows, enable object-access auditing (SACL on `C:\Lab\protected`, Security Event 4663) — it gives PID but not ProcessGuid, so the agent must join by PID+time. Marked as stretch.
 
 ### F3 (S1) — Flow-based correlation would have looked broken on stage
 NFStream (and every flow exporter) emits a flow record only when it **expires**: default `idle_timeout=120 s`, `active_timeout=1800 s`. A 2-second demo connection would show up on the dashboard two minutes after the host incident. Judges would conclude correlation does not work.
@@ -60,7 +60,7 @@ Three things that break matching silently: (a) a cross-subnet flow is seen on **
 ### F8 (S2) — Hardware does not fit the earlier plan
 Bashar's laptop (6 GB RAM) cannot load NF-UQ-NIDS-v2 (~75 M rows) and cannot run a VM lab. Anas's (8 GB) cannot host a Windows VM plus a gateway VM comfortably.
 
-**Decision:** The lab (3 VMs ≈ 9 GB) runs on Omar's and Rakan's 16 GB laptops (export as OVA; both keep an identical copy). Anas develops the Windows agent **on his physical Windows laptop with Sysmon installed**, against the mock server; he only needs the lab for integration days. Bashar trains on **Google Colab/Kaggle** (free CPU/GPU, >12 GB RAM) and develops the dashboard locally against fixtures and the mock server. Model bundles are small files committed via Git LFS or released as artifacts.
+**Decision:** The lab (3 VMs ≈ 9 GB) runs on Omar's and Rakan's 16 GB laptops (export as OVA; both keep an identical copy). Anas develops the Windows agent **on his physical Windows laptop with the narrow include-only Sysmon dev profile (`lab/sysmon/nexus-sysmon-dev.xml`, which logs only `C:\Lab\` activity and test markers)**, against the mock server; integration and all evaluation numbers come from the lab VM with the full lab profile; he only needs the lab for integration days. Bashar trains on **Google Colab/Kaggle** (free CPU/GPU, >12 GB RAM) and develops the dashboard locally against fixtures and the mock server. Model bundles are small files committed via Git LFS or released as artifacts.
 
 ### F9 (S2) — Sigma was treated as a rule source without an engine
 Sigma is a query-oriented format; pySigma backends translate to SIEM queries, not to a streaming graph matcher. Building a Sigma evaluator is a week you do not have.
@@ -97,7 +97,7 @@ Tetragon does not hash binaries. **Decision:** the Linux adapter computes SHA-25
 Private IPs have no reputation and there is no DNS. **Decision:** TI is demonstrated with **file hashes** (the EICAR test file is known to every vendor), with **offline feeds** (abuse.ch MalwareBazaar/Feodo/URLhaus CSVs loaded into the DB), and one clearly labelled **lab test indicator** (`192.168.20.10:8443` tagged `lab-test`) so the enrichment path is exercised end-to-end. VirusTotal lookups are cached and rate-limited (free tier: 4/min, 500/day).
 
 ### F17 (S3) — Things that will bite on Windows
-Defender/SmartScreen will quarantine or block "suspicious-looking" PowerShell scenarios. Add a Defender exclusion for `C:\Lab` on the lab VM only. Use the Windows 11 Enterprise 90-day evaluation ISO. Sysmon Event 3 is disabled by default — the provided config enables it.
+Defender/SmartScreen will quarantine or block "suspicious-looking" PowerShell scenarios. Add a Defender exclusion for `C:\Lab` on the lab VM only. Use the Windows 11 Enterprise 90-day evaluation ISO. Sysmon Event 3 is disabled by default — both provided configs enable it (the dev profile only for a few tool images and lab binaries). Only the dev profile has been validated on a real Windows installation (2026-11-18, Sysmon 15.22); the lab profile has not yet been loaded by a real Sysmon. See `lab/sysmon/README.md` (§3.1 matrix, §3.3 record) for what was verified and its limits.
 
 ### F18 (S3) — Out of scope, explicitly
 Signature antivirus, general ransomware prevention, automatic ML-driven blocking, LLM explanations, VLANs, Microsoft eBPF-for-Windows, multi-tenant anything. Each is listed as "future work" in the report with one sentence on why.
