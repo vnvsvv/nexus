@@ -1,0 +1,131 @@
+<!--
+  NEXUS Sysmon configuration - DEV LAPTOP profile (Sysmon 15.x, config schema 4.91)
+
+  STATUS: UNVALIDATED. This file was written without access to a real Windows installation and has
+  never been loaded by a real Sysmon. Review it, run the pre-install checks and the verification
+  matrix in lab/sysmon/README.md, and uninstall if anything unexpected is logged.
+  When it has been verified on a real machine, replace the word UNVALIDATED in this comment with
+  VALIDATED YYYY-MM-DD (tools/lint_sysmon_config.py requires exactly one of the two) and record the
+  date in STATUS.md.
+
+  PURPOSE: let one developer test the NEXUS Windows adapter on a personal laptop while logging
+  almost nothing about what the person normally does. Everything is "include" based: an event is
+  recorded only if it touches the lab folder C:\Lab\ or one of a few explicit test markers.
+
+  WHAT IS LOGGED (and nothing else):
+    EID 1   process creation   if the command line, parent command line, image or parent image
+                               mentions C:\Lab\, or the command line contains the marker NEXUS_TEST
+    EID 3   network connection only for cmd, powershell, pwsh, python, curl or anything under
+                               C:\Lab\ ; loopback, link-local and ports 80 and 443 are excluded
+    EID 5   process termination for the same small set of tool images (no command line is recorded)
+    EID 11  file creation      only under C:\Lab\ (except C:\Lab\manifests\)
+    EID 22  DNS query          only names ending in .nexus.test (a reserved test domain, RFC 6761)
+    EID 26  file delete        only under C:\Lab\ ; the deleted file is NOT archived
+
+  WHAT IS DELIBERATELY OFF: EID 23 (it copies every deleted file into C:\Sysmon), image loads,
+  registry, pipes, WMI, clipboard, process access, raw disk reads, driver loads, executable
+  detection. Browsers and normal applications never match any rule above.
+
+  CONVENTIONS: ASCII only, no double hyphen inside comments, and every RuleGroup sets groupRelation
+  explicitly so the file does not depend on a default. Same-field conditions are ORed and different
+  fields are ANDed unless groupRelation overrides; all groups here use "or".
+  Test scenarios on this profile must use destination ports other than 80 and 443 and a non-loopback
+  address (the laptop's own LAN IP is fine).
+-->
+<Sysmon schemaversion="4.91">
+  <HashAlgorithms>SHA256</HashAlgorithms>
+  <CheckRevocation>False</CheckRevocation>
+  <DnsLookup>False</DnsLookup>
+  <EventFiltering>
+
+    <!-- EID 1: only processes that are visibly part of a lab run -->
+    <RuleGroup name="ProcessCreate" groupRelation="or">
+      <ProcessCreate onmatch="include">
+        <CommandLine condition="contains">C:\Lab\</CommandLine>
+        <ParentCommandLine condition="contains">C:\Lab\</ParentCommandLine>
+        <Image condition="begin with">C:\Lab\</Image>
+        <ParentImage condition="begin with">C:\Lab\</ParentImage>
+        <CommandLine condition="contains">NEXUS_TEST</CommandLine>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- EID 3: tool processes and lab binaries only; no web traffic, no loopback -->
+    <RuleGroup name="NetworkConnect" groupRelation="or">
+      <NetworkConnect onmatch="include">
+        <Image condition="end with">\cmd.exe</Image>
+        <Image condition="end with">\powershell.exe</Image>
+        <Image condition="end with">\pwsh.exe</Image>
+        <Image condition="end with">\python.exe</Image>
+        <Image condition="end with">\curl.exe</Image>
+        <Image condition="begin with">C:\Lab\</Image>
+      </NetworkConnect>
+      <NetworkConnect onmatch="exclude">
+        <DestinationIp condition="begin with">127.</DestinationIp>
+        <DestinationIp condition="is">::1</DestinationIp>
+        <DestinationIp condition="is">0:0:0:0:0:0:0:1</DestinationIp>
+        <DestinationIp condition="begin with">fe80:</DestinationIp>
+        <DestinationPort condition="is">80</DestinationPort>
+        <DestinationPort condition="is">443</DestinationPort>
+      </NetworkConnect>
+    </RuleGroup>
+
+    <!-- EID 5: exits of the same tool images, so the adapter can close nodes. Carries no command line. -->
+    <RuleGroup name="ProcessTerminate" groupRelation="or">
+      <ProcessTerminate onmatch="include">
+        <Image condition="end with">\cmd.exe</Image>
+        <Image condition="end with">\powershell.exe</Image>
+        <Image condition="end with">\pwsh.exe</Image>
+        <Image condition="end with">\python.exe</Image>
+        <Image condition="end with">\curl.exe</Image>
+        <Image condition="begin with">C:\Lab\</Image>
+      </ProcessTerminate>
+    </RuleGroup>
+
+    <!-- EID 11: files created under the lab folder; manifests are the ground truth and not evidence -->
+    <RuleGroup name="FileCreate" groupRelation="or">
+      <FileCreate onmatch="include">
+        <TargetFilename condition="begin with">C:\Lab\</TargetFilename>
+      </FileCreate>
+      <FileCreate onmatch="exclude">
+        <TargetFilename condition="begin with">C:\Lab\manifests\</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+
+    <!-- EID 22: only the reserved test domain. Generate samples with: Resolve-DnsName probe.nexus.test -->
+    <RuleGroup name="DnsQuery" groupRelation="or">
+      <DnsQuery onmatch="include">
+        <QueryName condition="end with">.nexus.test</QueryName>
+      </DnsQuery>
+    </RuleGroup>
+
+    <!-- EID 26: delete detected, not archived -->
+    <RuleGroup name="FileDeleteDetected" groupRelation="or">
+      <FileDeleteDetected onmatch="include">
+        <TargetFilename condition="begin with">C:\Lab\</TargetFilename>
+      </FileDeleteDetected>
+    </RuleGroup>
+
+    <!-- EID 23 is OFF on purpose: it saves a copy of every matching deleted file under C:\Sysmon -->
+    <RuleGroup name="FileDelete" groupRelation="or">
+      <FileDelete onmatch="include" />
+    </RuleGroup>
+
+    <!-- Everything else is OFF: an include filter without rules logs nothing -->
+    <RuleGroup name="Off" groupRelation="or">
+      <FileCreateTime onmatch="include" />
+      <DriverLoad onmatch="include" />
+      <ImageLoad onmatch="include" />
+      <CreateRemoteThread onmatch="include" />
+      <RawAccessRead onmatch="include" />
+      <ProcessAccess onmatch="include" />
+      <RegistryEvent onmatch="include" />
+      <FileCreateStreamHash onmatch="include" />
+      <PipeEvent onmatch="include" />
+      <WmiEvent onmatch="include" />
+      <ClipboardChange onmatch="include" />
+      <ProcessTampering onmatch="include" />
+      <FileExecutableDetected onmatch="include" />
+    </RuleGroup>
+
+  </EventFiltering>
+</Sysmon>

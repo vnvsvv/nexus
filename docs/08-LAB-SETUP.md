@@ -36,7 +36,7 @@ Interface naming on the gateway: either accept the predictable names (`enp0s3`, 
 ## 3. Steps (Day 1–3)
 1. Install the gateway OS; attach the 4 NICs; run `lab/gateway/gateway-setup.sh` as root with the `IF_*` variables.
 2. Install `linux-vm-01`; set the static IP (netplan); `sudo apt install chrony curl python3-pip`; point chrony at 192.168.10.1 (`server 192.168.10.1 iburst` in `/etc/chrony/sources.d/nexus.sources`); create `/lab/{protected,staging,bin,scenarios,manifests}`; `echo "TOP SECRET LAB DATA" | sudo tee /lab/protected/confidential.txt`; install Tetragon per `lab/tetragon-policies/README.md`.
-3. Install `windows-vm-01` from the evaluation ISO; static IP; `w32tm` to 192.168.20.1; create `C:\Lab\{protected,staging,bin,scenarios,manifests}`; Sysmon per `lab/sysmon/README.md`; Defender exclusion for `C:\Lab` on this VM only; `python` (from python.org) for the `http.server` receiver.
+3. Install `windows-vm-01` from the evaluation ISO; static IP; `w32tm` to 192.168.20.1; create `C:\Lab\{protected,staging,bin,scenarios,manifests}`; Sysmon **lab profile** per `lab/sysmon/README.md` §4 (never the dev profile here, never the lab profile on a laptop); Defender exclusion for `C:\Lab` on this VM only; `python` (from python.org) for the `http.server` receiver.
 4. Verify routing: from Linux `curl -m 3 http://192.168.20.10:8443/` with `python -m http.server 8443` running on Windows (Windows Firewall: allow inbound 8443/8080 for the lab profile). On the gateway: `conntrack -E -e NEW -o timestamp` shows the connection; `nft list set inet nexus nexus_block_dst` exists.
 5. Verify time: `chronyc tracking` on Linux (offset < 10 ms); `w32tm /query /status` on Windows.
 6. Snapshot all three VMs: `lab-base`.
@@ -52,6 +52,10 @@ On the gateway, record `conntrack -E -e NEW -o timestamp` to a file. On the Linu
 | `exec_id` consistent exec vs kprobe (issue #4349) | | | |
 | Sysmon EID 3 includes `Initiated`, 5-tuple, ProcessGuid | | | |
 | Sysmon EID 11 for `C:\Lab\staging\*` | | | |
+| Sysmon EID 26 for a deleted `C:\Lab\` file; EID 23 absent | | | |
+| No Sysmon EID 3 to 192.168.20.1 while the agent posts; no EID 22 for `nexus-server`; no EID 11 for `C:\Lab\manifests\*` | | | |
+| Sysmon EID 3 with `Initiated=false`: which address is local (open question O1) | | | |
+| Both Sysmon configs loaded by a real Sysmon; `UNVALIDATED` replaced by `VALIDATED YYYY-MM-DD` in their headers | | | |
 | conntrack NEW within 50 ms of host connect | | | |
 | NFStream flow emitted ≤ 20 s after connection end (idle 15) | | | |
 | `nf-lite-1` direction convention confirmed | | | |

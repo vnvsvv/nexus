@@ -11,7 +11,7 @@ Everything in this document is a decision. Where a decision rests on an assumpti
    ┌──────────────────────────────────┐               ┌──────────────────────────────────┐
    │ Tetragon (eBPF)                  │               │ Sysmon (ETW-backed)              │
    │   exec/exit, file (kprobe),      │               │   EID 1,5 process; 3 network;    │
-   │   tcp_connect (kprobe)           │               │   11/23 file; 22 DNS             │
+   │   tcp_connect (kprobe)           │               │   11/26 file; 22 DNS             │
    │        │ JSON (unix socket/file) │               │        │ EvtSubscribe (XML)      │
    │   linux_adapter.py ──► HostEvent │               │   windows_adapter.py ──► HostEvent│
    │        │                         │               │        │                         │
@@ -70,8 +70,8 @@ OS-agnostic. Input: `HostEvent` objects. Output: `Incident` objects, `ResponseRe
 - Lab host (VirtualBox), scenario scripts, ground-truth manifests, replay/evaluation harness, benign noise generator.
 
 ### 2.4 `endpoint-windows/` (owner: Anas)
-- Sysmon installed with `lab/sysmon/nexus-sysmon.xml` (EID 1, 3, 5, 11, 22, 23 on; hashes SHA256; noise filtered).
-- `windows_adapter.py`: `win32evtlog.EvtSubscribe` on `Microsoft-Windows-Sysmon/Operational` (push), XML → `HostEvent`; `ProcessGuid` → `process_instance_id`; EID 3 `Initiated` → direction.
+- Sysmon with one of two profiles (`lab/sysmon/README.md`): `nexus-sysmon-dev.xml` on Anas's laptop (include-only, `C:\Lab\` and test markers; EID 1, 3, 5, 11, 22, 26) and `nexus-sysmon.xml` on `windows-vm-01` (same events, exclude-based; the source of all evaluation numbers). EID 23 is off in both because it archives deleted files; 26 reports the deletion without keeping a copy. SHA256 hashes. **Neither config has been validated on a real Windows installation yet.**
+- `windows_adapter.py`: `win32evtlog.EvtSubscribe` on `Microsoft-Windows-Sysmon/Operational` (push), XML → `HostEvent` for EID 1, 3, 5, 11, 22, 26 (23 tolerated); `ProcessGuid` → `process_instance_id`; EID 3 `Initiated` → direction. Events whose ProcessGuid was never seen in EID 1 get a placeholder node; EID 5 for unknown ids is ignored.
 - `windows_response.py`: `terminate_process` via `TerminateProcess`/`taskkill /PID /F`, same policy gate.
 - Runs as an elevated console process in the MVP; a Windows service wrapper (NSSM) is a stretch.
 
