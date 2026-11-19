@@ -7,6 +7,7 @@
 - 🟡 `lab/scenarios/noise.ps1` written, **not yet run on Windows**
 ## Omar — endpoint-linux / lab / eval harness
 - 🟡 lab VMs
+- 🟡 WP1 adapter verified with exec, exit, file permission and IPv4 loopback captures. Sanitized replays are in `endpoint-linux/tests/data/`. Routed TCP and live reader recovery remain unverified.
 ## Rakan — server
 - 🟡 gateway bootstrap
 ## Bashar — ml / dashboard

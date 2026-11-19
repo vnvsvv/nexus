@@ -1,0 +1,54 @@
+{
+  "4201": {
+    "case": "read",
+    "argv": [
+      "/usr/bin/cat",
+      "--",
+      "/lab/protected/fixture.txt"
+    ],
+    "pid": 4201,
+    "parent_pid": 4407,
+    "start_utc": "2000-01-01T00:00:10.099481000Z",
+    "end_utc": "2000-01-01T00:00:10.103399000Z",
+    "returncode": 0
+  },
+  "4202": {
+    "case": "write",
+    "argv": [
+      "/usr/bin/tee",
+      "--",
+      "/lab/staging/fixture.txt"
+    ],
+    "pid": 4202,
+    "parent_pid": 4407,
+    "start_utc": "2000-01-01T00:00:10.103612000Z",
+    "end_utc": "2000-01-01T00:00:10.110822000Z",
+    "returncode": 0
+  },
+  "4203": {
+    "case": "exit_17",
+    "argv": [
+      "/usr/bin/python3",
+      "-c",
+      "raise SystemExit(17)"
+    ],
+    "pid": 4203,
+    "parent_pid": 4407,
+    "start_utc": "2000-01-01T00:00:10.110937000Z",
+    "end_utc": "2000-01-01T00:00:10.125073000Z",
+    "returncode": 17
+  },
+  "4204": {
+    "case": "signaled_exit",
+    "argv": [
+      "/usr/bin/python3",
+      "-c",
+      "import time; time.sleep(60)"
+    ],
+    "pid": 4204,
+    "parent_pid": 4407,
+    "start_utc": "2000-01-01T00:00:10.125145000Z",
+    "end_utc": "2000-01-01T00:00:10.140018000Z",
+    "returncode": -15
+  }
+}
