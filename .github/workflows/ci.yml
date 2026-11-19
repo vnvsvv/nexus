@@ -8,12 +8,13 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install -e . && pip install fastapi uvicorn httpx pytest
+      - run: pip install -e ./endpoint-core   # before validate_fixtures so the rule-engine fixtures run once replay.py exists
       - run: python tools/validate_fixtures.py
       - run: pytest -q tests/
+      - run: pytest -q endpoint-core
       - run: python tools/lint_sysmon_config.py
       - run: python tools/check_samples.py
       # Each owner adds a job for their package when it exists:
-      # - run: pip install -e ./endpoint-core && pytest -q endpoint-core
       # - run: pip install -e ./ml && pytest -q ml
       # - run: pip install -e ./server && pytest -q server
       # - run: cd dashboard && npm ci && npm run typecheck && npm run build
