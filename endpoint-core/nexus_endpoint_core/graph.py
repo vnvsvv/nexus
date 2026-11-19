@@ -35,7 +35,9 @@ Bounds and garbage collection (nothing grows without limit)
       has retained children so lineage stays intact. When ``max_nodes`` forces eviction the order is: dead
       nodes without children (oldest ``dead_since`` first), dead nodes with children, then live nodes
       (oldest first). A removed parent leaves its children's ``parent_process_instance_id`` dangling;
-      ``ancestors`` simply stops there.
+      ``ancestors`` simply stops there. If a node with that same ``process_instance_id`` is created again
+      (a later event, or a new child naming it), it regains those surviving children: they are remembered
+      in an orphan index, so no scan of the graph is needed and the index never outgrows the node count.
     * "Now" for ``gc`` is ``clock()`` when a clock is supplied (use wall-clock UTC in the live agent, so one
       future-dated event cannot expire everything), else the newest event time (deterministic for replay).
 
@@ -165,6 +167,9 @@ class ProcessGraph:
         self.events: OrderedDict[str, HostEvent] = OrderedDict()   # bounded FIFO; full copies live in the store
         self.live_by_pid: dict[int, str] = {}
         self.latest_event_time: datetime | None = None
+        # Children whose parent was force-evicted (parent id -> child ids). Lets a restored parent regain its
+        # children in O(its orphans) without scanning the graph. Never larger than the number of nodes.
+        self._orphans: dict[str, set[str]] = {}
         self._order: dict[str, int] = {}          # event_id -> arrival rank; same keys as ``events``
         self._event_seq = itertools.count()
         self._node_seq = itertools.count()
@@ -460,10 +465,26 @@ class ProcessGraph:
             identity_resolution=PLACEHOLDER if placeholder else None,
             order=next(self._node_seq),
         )
-        self.nodes[node.process_instance_id] = node
+        self._register(node)
         if placeholder:
             self._index(node, override=False)
         return node
+
+    def _register(self, node: ProcessNode) -> None:
+        """Add a node to the graph. If children of this same process_instance_id survived an earlier forced
+        eviction of the node, re-attach them, so the reverse edge matches the children's ``parent`` ids."""
+        self.nodes[node.process_instance_id] = node
+        for child_id in self._orphans.pop(node.process_instance_id, ()):
+            child = self.nodes.get(child_id)
+            if child is not None and child.parent_process_instance_id == node.process_instance_id:
+                node.children.add(child_id)
+
+    def _unorphan(self, child_id: str, parent_id: str | None) -> None:
+        kids = self._orphans.get(parent_id) if parent_id is not None else None
+        if kids is not None:
+            kids.discard(child_id)
+            if not kids:
+                del self._orphans[parent_id]
 
     @staticmethod
     def _fill_missing(node: ProcessNode, ev: HostEvent, started: datetime | None) -> None:
@@ -491,8 +512,11 @@ class ProcessGraph:
         if self._is_lineage_of(parent_id, child.process_instance_id):
             log.warning("refusing parent link %s -> %s: it would create a cycle", parent_id, child.process_instance_id)
             return
-        if current is not None and current in self.nodes:
-            self.nodes[current].children.discard(child.process_instance_id)
+        if current is not None:
+            if current in self.nodes:
+                self.nodes[current].children.discard(child.process_instance_id)
+            else:
+                self._unorphan(child.process_instance_id, current)
         parent = self.nodes.get(parent_id)
         if parent is None:
             # Honest placeholder: we know the parent existed, nothing else about it.
@@ -500,7 +524,7 @@ class ProcessGraph:
                 process_instance_id=parent_id, parent_process_instance_id=None, pid=ppid or 0, ppid=None,
                 binary=UNKNOWN_BINARY, first_seen_utc=ts, placeholder=True, identity_resolution=PLACEHOLDER,
                 order=next(self._node_seq))
-            self.nodes[parent_id] = parent
+            self._register(parent)
             self._index(parent, override=False)
         parent.children.add(child.process_instance_id)
         child.parent_process_instance_id = parent_id
@@ -556,6 +580,12 @@ class ProcessGraph:
         parent = self.nodes.get(node.parent_process_instance_id or "")
         if parent is not None:
             parent.children.discard(node.process_instance_id)
+        else:
+            self._unorphan(node.process_instance_id, node.parent_process_instance_id)
+        if node.children:                              # forced eviction: remember who lost their parent
+            survivors = {c for c in node.children if c in self.nodes}
+            if survivors:
+                self._orphans.setdefault(node.process_instance_id, set()).update(survivors)
         for event_id in (node.start_event_id, node.exit_event_id, *node.file_events, *node.network_events, *node.dns_events):
             if event_id:
                 self._pop_event(event_id)

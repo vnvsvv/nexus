@@ -74,5 +74,5 @@ g.events_for(node_ids, event_types, window=(lo, hi)); g.gc(now=None)
 Single-threaded; sensor event order is assumed (an exit before its start is ignored); the event cache is FIFO, not
 LRU, and may evict an old start event of a long-lived process (the SQLite store keeps full copies, task A5); a
 forced eviction can leave a child pointing at a removed parent (`ancestors` stops there; the incident builder must
-report `PARENT_NOT_OBSERVED`); `apply` raises `ValueError` on a malformed timestamp, so the agent loop wraps it per
+report `PARENT_NOT_OBSERVED`; if the same `process_instance_id` comes back, the parent regains its surviving children); `apply` raises `ValueError` on a malformed timestamp, so the agent loop wraps it per
 event; datetimes passed in must be timezone-aware.

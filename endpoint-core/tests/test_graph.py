@@ -79,8 +79,19 @@ def assert_consistent(g: ProcessGraph) -> None:
                 referenced.add(ref)
         for child in node.children:
             assert g.nodes[child].parent_process_instance_id == node.process_instance_id
+        parent_id = node.parent_process_instance_id
+        if parent_id in g.nodes:                      # the reverse edge must exist whenever the parent is present
+            assert node.process_instance_id in g.nodes[parent_id].children, f"{node.process_instance_id} missing from its parent's children"
     assert set(g.events) == referenced, "cached event not referenced by any node"
     assert set(g._order) == set(g.events), "arrival ranks and the event cache disagree"
+    for parent_id, kids in g._orphans.items():       # the orphan index lists exactly the dangling parent ids
+        assert parent_id not in g.nodes and kids
+        for kid in kids:
+            assert kid in g.nodes and g.nodes[kid].parent_process_instance_id == parent_id
+    for node in g.nodes.values():
+        parent_id = node.parent_process_instance_id
+        if parent_id is not None and parent_id not in g.nodes:
+            assert node.process_instance_id in g._orphans.get(parent_id, ()), "dangling parent not indexed"
     for pid, nid in g.live_by_pid.items():
         assert nid in g.nodes and g.nodes[nid].pid == pid and g.nodes[nid].is_live
 
@@ -609,6 +620,113 @@ def test_arrival_order_survives_eviction():
     for event_id in ids:
         g.apply(ev("file_access", "a", t=1, pid=1, event_id=event_id))
     assert [e.event_id for e in g.events_for([pid_of("a")], ["file_access"])] == ids[-3:]
+    assert_consistent(g)
+
+
+# ------------------------------------------------------------------ parent restoration after forced eviction (Omar, round 2)
+def _evicted_parent_graph(**kw) -> ProcessGraph:
+    """p -> c, plus a filler so max_nodes=2 forces gc to evict the oldest live node (p) while c stays."""
+    g = ProcessGraph(max_nodes=2, retention_seconds=10_000, auto_gc_interval=0, **kw)
+    g.apply(ev("process_start", "p", t=0, pid=1))
+    g.apply(ev("process_start", "c", t=1, parent="p", pid=2, ppid=1))
+    g.apply(ev("process_start", "filler", t=2, pid=3))
+    assert g.gc() == 1 and pid_of("p") not in g                      # real eviction through gc, not a manual delete
+    assert g.nodes[pid_of("c")].parent_process_instance_id == pid_of("p") and g.ancestors(pid_of("c")) == []
+    return g
+
+
+def _both_directions(g: ProcessGraph, parent: str, children: list[str]) -> None:
+    for child in children:
+        assert pid_of(parent) in [a.process_instance_id for a in g.ancestors(pid_of(child))]
+    assert [d.process_instance_id for d in g.descendants(pid_of(parent), max_depth=1)] == [pid_of(c) for c in children]
+    assert g.nodes[pid_of(parent)].children == {pid_of(c) for c in children}             # a set: no duplicate edges
+
+
+def test_evicted_parent_restored_by_a_real_start_regains_its_children():
+    g = _evicted_parent_graph()
+    g.apply(ev("process_start", "p", t=10, pid=1))                   # same process_instance_id comes back
+    _both_directions(g, "p", ["c"])
+    g.apply(ev("file_access", "c", t=11, parent="p", pid=2))         # more activity on the child changes nothing
+    g.apply(ev("process_start", "c", t=12, parent="p", pid=2, ppid=1))   # not even a repeated start
+    _both_directions(g, "p", ["c"])
+    assert_consistent(g)
+
+
+def test_evicted_parent_restored_as_a_placeholder_from_its_own_event():
+    g = _evicted_parent_graph()
+    ghost = g.apply(ev("network_connect", "p", t=10, pid=1))
+    assert ghost.placeholder
+    _both_directions(g, "p", ["c"])
+    assert_consistent(g)
+
+
+def test_evicted_parent_restored_as_a_placeholder_when_a_new_child_names_it():
+    g = _evicted_parent_graph()
+    g.apply(ev("process_start", "c2", t=10, parent="p", pid=4, ppid=1))   # creates the placeholder parent "p"
+    assert g.nodes[pid_of("p")].placeholder
+    assert g.nodes[pid_of("p")].children == {pid_of("c"), pid_of("c2")}   # old child re-adopted, new child added
+    assert_consistent(g)
+
+
+def test_restoring_a_parent_regains_every_child_and_the_nested_tree():
+    g = ProcessGraph(max_nodes=5, retention_seconds=10_000, auto_gc_interval=0)
+    g.apply(ev("process_start", "p", t=0, pid=1))
+    g.apply(ev("process_start", "c1", t=1, parent="p", pid=2, ppid=1))
+    g.apply(ev("process_start", "c2", t=2, parent="p", pid=3, ppid=1))
+    g.apply(ev("process_start", "g1", t=3, parent="c1", pid=4, ppid=2))
+    for i, name in enumerate(("x", "y")):
+        g.apply(ev("process_start", name, t=4 + i, pid=10 + i))
+    assert g.gc() == 1 and pid_of("p") not in g                       # only p goes; its subtree stays
+    g.apply(ev("process_start", "p", t=20, pid=1))
+    _both_directions(g, "p", ["c1", "c2"])
+    assert [d.process_instance_id for d in g.descendants(pid_of("p"))] == [pid_of("c1"), pid_of("c2"), pid_of("g1")]
+    assert [a.process_instance_id for a in g.ancestors(pid_of("g1"))] == [pid_of("c1"), pid_of("p")]
+    assert g.lineage_contains(pid_of("g1"), pid_of("p"), 2)
+    assert_consistent(g)
+
+
+def test_repeated_eviction_and_restoration_stays_consistent():
+    g = ProcessGraph(max_nodes=3, retention_seconds=10_000, auto_gc_interval=0)
+    g.apply(ev("process_start", "p", t=0, pid=1))
+    g.apply(ev("process_start", "c", t=1, parent="p", pid=2, ppid=1))
+    g.apply(ev("process_start", "f1", t=2, pid=3))
+    g.apply(ev("process_start", "f2", t=3, pid=4))
+    for cycle in range(5):
+        assert g.gc() == 1 and pid_of("p") not in g                    # p is always the oldest live node
+        assert g._orphans == {pid_of("p"): {pid_of("c")}}
+        assert g.ancestors(pid_of("c")) == []
+        g.apply(ev("process_start", "p", t=10 + cycle, pid=1, process_start_time_utc=iso(0)))   # real start time: oldest again
+        _both_directions(g, "p", ["c"])
+        assert g._orphans == {}
+        assert_consistent(g)
+
+
+def test_an_orphaned_child_that_is_itself_removed_leaves_no_trace():
+    g = _evicted_parent_graph()
+    assert g._orphans == {pid_of("p"): {pid_of("c")}}
+    g.apply(ev("process_exit", "c", t=3, pid=2))
+    g.gc(now=at(100_000))                                              # retention removes the exited orphan
+    assert pid_of("c") not in g and g._orphans == {}
+    g.apply(ev("process_start", "p", t=200_000, pid=1))
+    assert g.nodes[pid_of("p")].children == set()
+    assert_consistent(g)
+
+
+def test_restoring_a_parent_never_creates_a_cycle():
+    g = _evicted_parent_graph()
+    g.apply(ev("process_start", "p", t=10, pid=1, parent="c", ppid=2))   # restored p claims its own child as parent
+    assert g.nodes[pid_of("p")].parent_process_instance_id is None
+    assert [a.process_instance_id for a in g.ancestors(pid_of("c"))] == [pid_of("p")]
+    assert [a.process_instance_id for a in g.ancestors(pid_of("p"))] == []
+    assert_consistent(g)
+
+
+def test_restoring_a_parent_does_not_disturb_pid_ownership():
+    g = _evicted_parent_graph()
+    g.apply(ev("process_start", "q", t=5, pid=1))                      # another process now owns PID 1
+    ghost = g.apply(ev("file_access", "p", t=10, pid=1))               # p reappears only as a placeholder
+    assert ghost.placeholder and g.live_by_pid[1] == pid_of("q")
+    _both_directions(g, "p", ["c"])
     assert_consistent(g)
 
 
