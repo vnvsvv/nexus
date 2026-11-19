@@ -12,8 +12,13 @@ Liveness (never invents an exit)
     ``end_time_utc`` is set only from an observed ``process_exit``. When a newer process takes over a PID
     whose previous holder never reported an exit, the old node gets ``superseded_by`` and
     ``superseded_at_utc`` (the new holder's start time) and ``end_time_utc`` stays ``None``.
-    ``is_live`` is False for both exited and superseded nodes; use it, not ``end_time_utc``, to decide
-    whether a process can still be acted on. ``dead_since`` is the time retention counts from.
+    ``is_live`` is False for both exited and superseded nodes; it is a *necessary* condition for acting on
+    a process (use it, not ``end_time_utc``), but never a *sufficient* one. The graph only knows what the
+    sensor reported: a placeholder's PID is a guess, an ambiguous placeholder is merely un-indexed and stays
+    ``is_live``, and an exit may simply not have been observed yet. The response gate (A6) must therefore
+    also verify, against the operating system at action time, that the PID is still owned by the same
+    process (executable path, and start time where available) before it terminates anything.
+    ``dead_since`` is the time retention counts from.
 
 Bounds and garbage collection (nothing grows without limit)
     * ``max_events``: strict cap on the event cache (FIFO eviction). Evicting an event also removes the
@@ -34,6 +39,14 @@ Bounds and garbage collection (nothing grows without limit)
     * "Now" for ``gc`` is ``clock()`` when a clock is supplied (use wall-clock UTC in the live agent, so one
       future-dated event cannot expire everything), else the newest event time (deterministic for replay).
 
+Ordering and atomicity
+    * Equal timestamps keep meaningful order: ``events_for`` sorts by (timestamp, arrival order) and
+      ``descendants`` by (start time, order in which the graph first saw the process). Event and process IDs
+      are never used as tie-breakers: they can be random (Tetragon exec ids, ``new_event_id``).
+    * ``apply`` is atomic with respect to bad input: every timestamp it needs (``timestamp_utc`` and the
+      optional ``process_start_time_utc``) is parsed before anything is changed, so a ``ValueError`` leaves
+      the graph exactly as it was (including the event clock and the gc counter).
+
 Known limitations (see also endpoint-core/README.md)
     * Single-threaded; callers must not share a graph across threads.
     * ``apply`` returns the affected node, but a later ``apply`` (automatic gc) or ``gc`` may remove it.
@@ -47,6 +60,7 @@ Known limitations (see also endpoint-core/README.md)
 """
 from __future__ import annotations
 
+import itertools
 import logging
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -107,6 +121,7 @@ class ProcessNode:
     network_events: list[str] = field(default_factory=list, repr=False)
     dns_events: list[str] = field(default_factory=list, repr=False)
     rule_hits: list[str] = field(default_factory=list, repr=False)
+    order: int = field(default=0, repr=False)   # runtime-only arrival rank (never part of HostEvent/Incident); tie-breaker
 
     @property
     def sort_time(self) -> datetime:
@@ -119,7 +134,8 @@ class ProcessNode:
 
     @property
     def is_live(self) -> bool:
-        """False once exited or superseded. Gate every action on this, not on ``end_time_utc``."""
+        """False once exited or superseded. Required before any action, never enough on its own: the response
+        gate must also re-verify PID ownership and process identity against the OS (see module docstring)."""
         return self.end_time_utc is None and self.superseded_by is None
 
 
@@ -149,6 +165,9 @@ class ProcessGraph:
         self.events: OrderedDict[str, HostEvent] = OrderedDict()   # bounded FIFO; full copies live in the store
         self.live_by_pid: dict[int, str] = {}
         self.latest_event_time: datetime | None = None
+        self._order: dict[str, int] = {}          # event_id -> arrival rank; same keys as ``events``
+        self._event_seq = itertools.count()
+        self._node_seq = itertools.count()
         self._since_gc = 0
         self._warned_over_capacity = False
 
@@ -183,7 +202,7 @@ class ProcessGraph:
         return out
 
     def descendants(self, process_instance_id: str, max_depth: int = 5, since: datetime | None = None) -> list[ProcessNode]:
-        """Breadth-first, ties broken by (start time, id). ``since`` (aware) keeps only nodes that started
+        """Breadth-first; siblings by (start time, arrival order of first sight). ``since`` (aware) keeps only nodes that started
         (or were first seen) at or after it; the walk still passes through older nodes because a late
         child can hang below an early one."""
         out: list[ProcessNode] = []
@@ -195,7 +214,7 @@ class ProcessGraph:
             if cur is None or depth >= max_depth:
                 continue
             kids = sorted((self.nodes[c] for c in cur.children if c in self.nodes and c not in seen),
-                          key=lambda n: (n.sort_time, n.process_instance_id))
+                          key=lambda n: (n.sort_time, n.order))
             for kid in kids:
                 seen.add(kid.process_instance_id)
                 if since is None or kid.sort_time >= since:
@@ -228,7 +247,8 @@ class ProcessGraph:
     def events_for(self, node_ids: Iterable[str], types: Iterable[str],
                    window: tuple[datetime | None, datetime | None] | None = None) -> list[HostEvent]:
         """Cached events of the given nodes and event types, optionally inside an inclusive (aware) time
-        window, ordered by (timestamp, event_id), without duplicates. Evicted events are not returned."""
+        window, ordered by (timestamp, arrival order), without duplicates: events with equal timestamps come
+        back in the order they were applied, never in event-id order. Evicted events are not returned."""
         wanted = set(types)
         lo, hi = window if window else (None, None)
         found: dict[str, tuple[datetime, HostEvent]] = {}
@@ -255,7 +275,7 @@ class ProcessGraph:
                 if (lo is not None and t < lo) or (hi is not None and t > hi):
                     continue
                 found[event_id] = (t, ev)
-        return [ev for _, ev in sorted(found.values(), key=lambda p: (p[0], p[1].event_id))]
+        return [ev for _, ev in sorted(found.values(), key=lambda p: (p[0], self._order.get(p[1].event_id, 0)))]
 
     # ------------------------------------------------------------------ apply
     def apply(self, ev: HostEvent) -> ProcessNode | None:
@@ -263,10 +283,12 @@ class ProcessGraph:
 
         Returns None only for a ``process_exit`` of a process the graph has never seen (ignored, per
         docs/02 section 1). A duplicate ``event_id`` still in the cache is a no-op returning the node.
-        Raises ``ValueError`` (before changing anything) for a malformed ``timestamp_utc``.
-        Automatic gc, when due, runs first, so the returned node is in the graph until the next call.
+        Raises ``ValueError`` for a malformed ``timestamp_utc`` or ``process_start_time_utc``; both are
+        parsed first, so a rejected event changes nothing. Automatic gc, when due, runs next, so the
+        returned node is in the graph until the next call.
         """
         ts = parse_utc(ev.timestamp_utc)
+        started = parse_utc(ev.process_start_time_utc) if ev.process_start_time_utc else None
         self._auto_gc()
         if self.latest_event_time is None or ts > self.latest_event_time:
             self.latest_event_time = ts
@@ -286,28 +308,28 @@ class ProcessGraph:
             return node
 
         if ev.event_type == "process_start":
-            return self._apply_start(ev, ts)
+            return self._apply_start(ev, ts, started)
 
         node = self.nodes.get(ev.process_instance_id)
         if node is None:
-            node = self._create_from_event(ev, ts, placeholder=True)
+            node = self._create_from_event(ev, ts, started, placeholder=True)
         else:
-            self._fill_missing(node, ev)
+            self._fill_missing(node, ev, started)
         if ev.parent_process_instance_id and node.parent_process_instance_id is None:
             self._link_parent(node, ev.parent_process_instance_id, ev.ppid, ts, replace=False)
         refs: list[str] = getattr(node, _REF_LIST[ev.event_type])
         refs.append(ev.event_id)
         self._store_event(ev)
         if len(refs) > self.max_events_per_node:      # strict per-node cap: drop the oldest reference and its event
-            self.events.pop(refs.pop(0), None)
+            self._pop_event(refs.pop(0))
         return node
 
-    def _apply_start(self, ev: HostEvent, ts: datetime) -> ProcessNode:
+    def _apply_start(self, ev: HostEvent, ts: datetime, started: datetime | None) -> ProcessNode:
         placeholder_ev = _wants_placeholder(ev)
         node = self.nodes.get(ev.process_instance_id)
         replace_parent = False
         if node is None:
-            node = self._create_from_event(ev, ts, placeholder=placeholder_ev)
+            node = self._create_from_event(ev, ts, started, placeholder=placeholder_ev)
             node.command_line = ev.command_line
             node.sha256 = ev.sha256
             node.identity_resolution = PLACEHOLDER if placeholder_ev else ev.attributes.get("identity_resolution")
@@ -323,12 +345,15 @@ class ProcessGraph:
             node.command_line = _keep(ev.command_line, node.command_line)
             node.user = _keep(ev.user, node.user)
             node.sha256 = _keep(ev.sha256, node.sha256)
-            node.start_time_utc = parse_utc(ev.process_start_time_utc) if ev.process_start_time_utc else ts
+            node.start_time_utc = started or ts
             node.placeholder = False
             node.identity_resolution = ev.attributes.get("identity_resolution")
+            if node.start_event_id is not None:       # a seeded placeholder's synthetic start gives way to the real one
+                self._pop_event(node.start_event_id)
+                node.start_event_id = None
             replace_parent = True
         else:
-            self._fill_missing(node, ev)
+            self._fill_missing(node, ev, started)
         if node.start_event_id is None:               # a repeated start of a known instance is not stored again
             node.start_event_id = ev.event_id
             self._store_event(ev)
@@ -373,8 +398,8 @@ class ProcessGraph:
     def _eviction_key(n: ProcessNode) -> tuple:
         dead = n.dead_since
         if dead is not None:
-            return (1 if n.children else 0, dead, n.process_instance_id)    # dead leaves, then dead parents
-        return (2, n.sort_time, n.process_instance_id)                      # live nodes, oldest first
+            return (1 if n.children else 0, dead, n.order)    # dead leaves, then dead parents
+        return (2, n.sort_time, n.order)                      # live nodes, oldest first
 
     def _now(self) -> datetime | None:
         return self._clock() if self._clock is not None else self.latest_event_time
@@ -391,10 +416,17 @@ class ProcessGraph:
 
     # ------------------------------------------------------------------ internals
     def _store_event(self, ev: HostEvent) -> None:
+        if ev.event_id not in self.events:
+            self._order[ev.event_id] = next(self._event_seq)       # arrival rank: the tie-breaker for equal timestamps
         self.events[ev.event_id] = ev
         while len(self.events) > self.max_events:
             _, old = self.events.popitem(last=False)
+            self._order.pop(old.event_id, None)
             self._forget(old)
+
+    def _pop_event(self, event_id: str) -> None:
+        self.events.pop(event_id, None)
+        self._order.pop(event_id, None)
 
     def _forget(self, ev: HostEvent) -> None:
         """An event left the cache: drop the node's reference so references never outlive the event."""
@@ -414,7 +446,7 @@ class ProcessGraph:
             except ValueError:
                 pass
 
-    def _create_from_event(self, ev: HostEvent, ts: datetime, placeholder: bool) -> ProcessNode:
+    def _create_from_event(self, ev: HostEvent, ts: datetime, started: datetime | None, placeholder: bool) -> ProcessNode:
         node = ProcessNode(
             process_instance_id=ev.process_instance_id,
             parent_process_instance_id=None,
@@ -423,10 +455,10 @@ class ProcessGraph:
             binary=ev.binary,
             user=ev.user,
             first_seen_utc=ts,
-            start_time_utc=(parse_utc(ev.process_start_time_utc) if ev.process_start_time_utc
-                            else (ts if ev.event_type == "process_start" and not placeholder else None)),
+            start_time_utc=started or (ts if ev.event_type == "process_start" and not placeholder else None),
             placeholder=placeholder,
             identity_resolution=PLACEHOLDER if placeholder else None,
+            order=next(self._node_seq),
         )
         self.nodes[node.process_instance_id] = node
         if placeholder:
@@ -434,7 +466,7 @@ class ProcessGraph:
         return node
 
     @staticmethod
-    def _fill_missing(node: ProcessNode, ev: HostEvent) -> None:
+    def _fill_missing(node: ProcessNode, ev: HostEvent, started: datetime | None) -> None:
         """Add facts an event carries that the node lacks. Never overwrites an existing value."""
         if node.binary == UNKNOWN_BINARY and ev.binary != UNKNOWN_BINARY:
             node.binary = ev.binary
@@ -442,8 +474,8 @@ class ProcessGraph:
         node.ppid = _keep(node.ppid, ev.ppid)
         node.command_line = _keep(node.command_line, ev.command_line)
         node.sha256 = _keep(node.sha256, ev.sha256)
-        if node.start_time_utc is None and ev.process_start_time_utc:
-            node.start_time_utc = parse_utc(ev.process_start_time_utc)
+        if node.start_time_utc is None and started is not None:
+            node.start_time_utc = started
 
     def _link_parent(self, child: ProcessNode, parent_id: str, ppid: int | None, ts: datetime, replace: bool) -> None:
         if parent_id == child.process_instance_id:
@@ -466,7 +498,8 @@ class ProcessGraph:
             # Honest placeholder: we know the parent existed, nothing else about it.
             parent = ProcessNode(
                 process_instance_id=parent_id, parent_process_instance_id=None, pid=ppid or 0, ppid=None,
-                binary=UNKNOWN_BINARY, first_seen_utc=ts, placeholder=True, identity_resolution=PLACEHOLDER)
+                binary=UNKNOWN_BINARY, first_seen_utc=ts, placeholder=True, identity_resolution=PLACEHOLDER,
+                order=next(self._node_seq))
             self.nodes[parent_id] = parent
             self._index(parent, override=False)
         parent.children.add(child.process_instance_id)
@@ -500,12 +533,15 @@ class ProcessGraph:
         if not override:
             return
         holder = self.nodes.get(holder_id)
-        if holder is not None and holder.sort_time > node.sort_time:
-            if not holder.placeholder and node.superseded_by is None:
-                node.superseded_by = holder.process_instance_id        # holder started later: we are the older one
+        if holder is not None and not holder.placeholder and holder.sort_time > node.sort_time:
+            if node.superseded_by is None:
+                node.superseded_by = holder.process_instance_id        # a real holder started later: we are the older one
                 node.superseded_at_utc = holder.sort_time
             return
-        if holder is not None and holder.is_live:
+        # A placeholder only guesses at its PID (a parent hint, or a process whose start we missed), so a real
+        # start always takes the PID from it. The placeholder is declared superseded only when it is provably
+        # older; when its apparent age is ambiguous it is merely un-indexed (is_live stays as it was).
+        if holder is not None and holder.is_live and holder.sort_time <= node.sort_time:
             holder.superseded_by = node.process_instance_id            # no exit was seen; do not invent one
             holder.superseded_at_utc = node.sort_time
         self.live_by_pid[node.pid] = node.process_instance_id
@@ -522,4 +558,4 @@ class ProcessGraph:
             parent.children.discard(node.process_instance_id)
         for event_id in (node.start_event_id, node.exit_event_id, *node.file_events, *node.network_events, *node.dns_events):
             if event_id:
-                self.events.pop(event_id, None)
+                self._pop_event(event_id)

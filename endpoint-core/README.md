@@ -46,14 +46,28 @@ g.events_for(node_ids, event_types, window=(lo, hi)); g.gc(now=None)
   seed a placeholder with `attributes.placeholder=true` or `identity_resolution="placeholder"` on a `process_start`.
 * **Exits and PID reuse.** `end_time_utc` comes only from an observed exit. If a newer start takes over a PID whose
   holder never exited, the old node gets `superseded_by` / `superseded_at_utc` and stays `end_time_utc=None`;
-  an older start arriving late never takes the PID. Use `node.is_live` (false for exited and superseded) before
-  acting on a process, and `node.dead_since` for retention.
+  an older start arriving late never takes the PID. `node.is_live` (false for exited and superseded) is required
+  before acting on a process, and `node.dead_since` drives retention.
+* **`is_live` is necessary, not sufficient (decision for the response gate, task A6, not implemented yet).** The
+  graph only knows what the sensor reported: a placeholder's PID is a guess, an ambiguous placeholder is just
+  un-indexed and keeps `is_live`, and an exit may not have been observed yet. Before terminating anything the
+  gate must also verify against the OS, at action time, that the PID is still owned by the same process
+  (executable path, plus start time where available). `ProcessNode.order` is a runtime-only arrival rank; it is
+  never part of `HostEvent`, `Incident` or any schema.
 * **Bounds.** Event cache `max_events` and per-node references `max_events_per_node` are strict and always agree
   (evicting an event removes the reference). Nodes: `gc()` removes dead nodes older than `retention_seconds` (kept
   while they still have retained children), then enforces `max_nodes` (dead leaves, dead parents, then oldest live).
   `gc()` runs by itself every `auto_gc_interval` applied events, so the graph exceeds `max_nodes` by at most
   `2 * auto_gc_interval` between runs. `auto_gc_interval=0` leaves gc to the caller (one warning if it is neglected).
   In the live agent pass `clock=lambda: datetime.now(timezone.utc)`; replay omits it and uses the newest event time.
+* **Ordering.** `events_for` returns events by (timestamp, arrival order) and `descendants` orders siblings by
+  (start time, order first seen). IDs are never tie-breakers: Tetragon exec ids and `new_event_id()` are random, so an
+  ID sort would scramble events that share a millisecond.
+* **Atomic rejection.** `apply` parses `timestamp_utc` and `process_start_time_utc` before touching anything; a
+  malformed value raises `ValueError` and leaves the graph (nodes, cache, PID index, clocks) exactly as it was.
+* **PID ownership.** A real start always takes a PID from a placeholder, whatever the placeholder's apparent age; a
+  placeholder never takes a PID a real process holds. A seeded placeholder's synthetic start event is replaced by the
+  authoritative one, so `events_for(..., ["process_start"])` returns the real start (subject to cache retention).
 * **Time.** `parse_utc` / `format_utc` convert to and from `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 
 ### Known limitations

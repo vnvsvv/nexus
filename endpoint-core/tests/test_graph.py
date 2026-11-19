@@ -1,6 +1,7 @@
 """ProcessGraph tests. Fixtures come from contracts/fixtures; synthetic events are validated as HostEvent."""
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 import logging
@@ -79,6 +80,7 @@ def assert_consistent(g: ProcessGraph) -> None:
         for child in node.children:
             assert g.nodes[child].parent_process_instance_id == node.process_instance_id
     assert set(g.events) == referenced, "cached event not referenced by any node"
+    assert set(g._order) == set(g.events), "arrival ranks and the event cache disagree"
     for pid, nid in g.live_by_pid.items():
         assert nid in g.nodes and g.nodes[nid].pid == pid and g.nodes[nid].is_live
 
@@ -435,12 +437,12 @@ def test_descendants_depth_and_since():
     assert [d.process_instance_id for d in g.descendants(pid_of("p0"), since=at(25))] == [pid_of("p3"), pid_of("p4")]
 
 
-def test_descendants_break_ties_by_id():
+def test_descendants_with_equal_start_times_keep_arrival_order_not_id_order():
     g = ProcessGraph()
     g.apply(ev("process_start", "root", pid=1))
     for name, pid in (("zeta", 2), ("alpha", 3), ("mid", 4)):
         g.apply(ev("process_start", name, t=1, parent="root", pid=pid))      # identical start times
-    assert [d.process_instance_id for d in g.descendants(pid_of("root"))] == [pid_of("alpha"), pid_of("mid"), pid_of("zeta")]
+    assert [d.process_instance_id for d in g.descendants(pid_of("root"))] == [pid_of("zeta"), pid_of("alpha"), pid_of("mid")]
 
 
 def test_lineage_contains_variants():
@@ -478,6 +480,136 @@ def test_events_for_filters_types_and_window_and_orders():
     assert g.events_for(ids, ["file_access"], (at(3.5), None)) == []
     assert len(g.events_for(ids, ["file_access"], (at(3), at(3)))) == 1               # bounds are inclusive
     assert len(g.events_for([pid_of("a"), pid_of("a")], ["file_access"])) == 1       # no duplicates
+
+
+# ------------------------------------------------------------------ review of PR 3 (Omar): regression tests
+def snapshot(g: ProcessGraph) -> dict:
+    return {
+        "nodes": {k: dataclasses.asdict(n) for k, n in g.nodes.items()},     # asdict copies sets and lists
+        "events": list(g.events),
+        "live_by_pid": dict(g.live_by_pid),
+        "latest_event_time": g.latest_event_time,
+        "since_gc": g._since_gc,
+    }
+
+
+@pytest.mark.parametrize("ghost_t, real_t, ghost_superseded", [(50, 40, False), (50, 50, True), (50, 60, True)])
+def test_a_placeholder_never_keeps_the_pid_over_a_real_start(ghost_t, real_t, ghost_superseded):
+    g = ProcessGraph()
+    ghost = g.apply(ev("file_access", "ghost", t=ghost_t, pid=5))            # placeholder, first seen at ghost_t
+    real = g.apply(ev("process_start", "real", t=real_t, pid=5))             # authoritative start, any apparent age
+    assert g.live_by_pid[5] == pid_of("real") and g.live_node_for_pid(5) is real and real.is_live
+    # only a placeholder that is provably older is declared superseded; an ambiguous one is left alone
+    assert (ghost.superseded_by == pid_of("real")) is ghost_superseded
+    g.apply(ev("network_connect", "later-ghost", t=real_t + 1, pid=5))       # a new placeholder cannot take it back
+    assert g.live_by_pid[5] == pid_of("real")
+    assert_consistent(g)
+
+
+def test_a_parent_hint_placeholder_does_not_keep_a_pid_a_real_start_owns():
+    g = ProcessGraph()
+    g.apply(ev("process_start", "kid", t=10, parent="hint", pid=2, ppid=7))   # placeholder parent "hint", pid 7, seen at +10
+    real = g.apply(ev("process_start", "real7", t=5, pid=7))
+    assert g.live_by_pid[7] == pid_of("real7") and g.live_node_for_pid(7) is real
+
+
+def _bad_start(kind: str = "process_start", **kw):
+    return lambda: ev(kind, kw.pop("proc", "p"), t=100, pid=70, process_start_time_utc="garbage", **kw)
+
+
+_FAILING = [
+    ("new real start", lambda g: None, _bad_start(user="u", parent="gp", ppid=3)),
+    ("placeholder upgrade", lambda g: g.apply(ev("file_access", "p", t=0, pid=7, binary="C:\\known.exe")),
+     _bad_start(user="u", parent="gp", ppid=3, binary="C:\\real.exe")),
+    ("seeded placeholder start", lambda g: None, _bad_start(attributes={"placeholder": True})),
+    ("event on a known node", lambda g: g.apply(ev("process_start", "p", t=0, pid=7)),
+     _bad_start("file_access", user="u", ppid=3)),
+    ("event from an unknown process", lambda g: None, _bad_start("network_connect", proc="q", parent="gp", ppid=3)),
+]
+
+
+@pytest.mark.parametrize("name, setup, make_bad", _FAILING, ids=[f[0] for f in _FAILING])
+def test_a_malformed_optional_start_time_cannot_leave_partial_state(name, setup, make_bad):
+    g = ProcessGraph(auto_gc_interval=1)
+    setup(g)
+    before = snapshot(g)
+    with pytest.raises(ValueError):
+        g.apply(make_bad())
+    assert snapshot(g) == before                                               # nothing at all changed
+    assert g.apply(ev("process_start", "p", t=101, pid=7)) is not None          # and the graph still works
+    assert_consistent(g)
+
+
+def test_a_malformed_primary_timestamp_also_changes_nothing():
+    g = ProcessGraph(auto_gc_interval=1)
+    g.apply(ev("process_start", "p", t=0, pid=7))
+    before = snapshot(g)
+    with pytest.raises(ValueError):
+        g.apply(ev("file_access", "p", t=5, pid=7, timestamp_utc="garbage"))
+    assert snapshot(g) == before
+
+
+def test_promoting_a_seeded_placeholder_keeps_the_authoritative_start_event():
+    g = ProcessGraph()
+    seed = ev("process_start", "s", t=0, pid=50, attributes={"identity_resolution": "placeholder"})
+    real = ev("process_start", "s", t=5, pid=50, command_line="s.exe", attributes={"identity_resolution": "native"})
+    g.apply(seed)
+    node = g.apply(real)
+    assert not node.placeholder and node.start_event_id == real.event_id
+    assert [e.event_id for e in g.events_for([pid_of("s")], ["process_start"])] == [real.event_id]
+    assert real.event_id in g.events and seed.event_id not in g.events          # the synthetic seed is replaced, not leaked
+    assert g.apply(real) is node and len(g.events) == 1                         # re-delivery is still a no-op
+    assert_consistent(g)
+
+
+def test_promoting_an_event_created_placeholder_keeps_both_start_and_earlier_events():
+    g = ProcessGraph()
+    early = ev("file_access", "s", t=0, pid=50)
+    real = ev("process_start", "s", t=5, pid=50)
+    g.apply(early)
+    g.apply(real)
+    got = g.events_for([pid_of("s")], ["process_start", "file_access"])
+    assert [e.event_id for e in got] == [early.event_id, real.event_id]
+
+
+def test_a_repeated_start_does_not_replace_a_real_start_event():
+    g = ProcessGraph()
+    first = ev("process_start", "r", t=0, pid=9)
+    g.apply(first)
+    g.apply(ev("process_start", "r", t=1, pid=9))
+    assert [e.event_id for e in g.events_for([pid_of("r")], ["process_start"])] == [first.event_id]
+
+
+def test_equal_timestamps_keep_arrival_order_not_event_id_order():
+    g = ProcessGraph()
+    g.apply(ev("process_start", "a", t=0, pid=1))
+    ids = [f"{EP}:evt-0000000000f{i}" for i in (3, 2, 1)]                       # arrival order is descending by id
+    for event_id in ids:
+        g.apply(ev("file_access", "a", t=1, pid=1, event_id=event_id))
+    assert [e.event_id for e in g.events_for([pid_of("a")], ["file_access"])] == ids
+
+
+def test_equal_timestamp_order_holds_across_nodes_and_types_and_timestamp_stays_primary():
+    g = ProcessGraph()
+    a_start = ev("process_start", "a", t=1, pid=1, event_id=f"{EP}:evt-00000000000f")
+    b_start = ev("process_start", "b", t=1, pid=2, event_id=f"{EP}:evt-00000000000e")
+    a_file = ev("file_access", "a", t=1, pid=1, event_id=f"{EP}:evt-00000000000d")
+    early = ev("network_connect", "a", t=0.5, pid=1, event_id=f"{EP}:evt-00000000000c")   # arrives last, happened first
+    for e in (a_start, b_start, a_file, early):
+        g.apply(e)
+    got = g.events_for([pid_of("b"), pid_of("a")], ["process_start", "file_access", "network_connect"])
+    assert [e.event_id for e in got] == [early.event_id, a_start.event_id, b_start.event_id, a_file.event_id]
+    again = g.events_for([pid_of("a"), pid_of("b")], ["file_access", "network_connect", "process_start"])
+    assert [e.event_id for e in again] == [e.event_id for e in got]            # independent of argument order
+
+
+def test_arrival_order_survives_eviction():
+    g = ProcessGraph(max_events=3)
+    ids = [f"{EP}:evt-0000000000a{i}" for i in (9, 8, 7, 6, 5)]                 # descending ids, equal timestamps
+    for event_id in ids:
+        g.apply(ev("file_access", "a", t=1, pid=1, event_id=event_id))
+    assert [e.event_id for e in g.events_for([pid_of("a")], ["file_access"])] == ids[-3:]
+    assert_consistent(g)
 
 
 # ------------------------------------------------------------------ retention and gc
