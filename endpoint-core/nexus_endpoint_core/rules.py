@@ -5,7 +5,8 @@ events: evaluation (matching, lineage traversal, windows, suppression) is task A
 
 Public API
     ``load_rules(dir, *, attack_mapping=None, strict=False) -> RuleSet``   a directory of rules
-    ``load_rule(path, *, attack_mapping=None) -> Rule``                    one file (raises ``RuleError``)
+    ``load_rule(path, *, attack_mapping=None) -> Rule``                    one file (raises ``RuleError``); a
+                                                                           mapping may be a path or an AttackMapping
     ``load_attack_mapping(path) -> AttackMapping``                         contracts/attack-mapping.yaml
     ``Rule`` and its parts (``Step``, ``Predicate``, ``Lineage``, ``Context``, ``ThresholdSpec``, ``Scope``,
     ``ResponseSpec``), ``RuleSet``, ``AttackMapping``, ``RuleError``, ``RuleLoadError``, ``AttackMappingError``.
@@ -19,6 +20,15 @@ Failure policy
     impossible to load: a stray copy under another name is rejected (naming the file it should be) and the
     correctly named original stays authoritative. Within one rule, field-level problems are reported first;
     cross-field problems (lineage targets, kind consistency, response) appear once those are fixed.
+
+Resilience: one file can never abort the load
+    Every file is read with bounded resources: at most 64 KiB, YAML nesting of at most 20 levels (checked on the
+    parser's iterative event stream, before the recursive constructor runs; a RecursionError there is also
+    converted), no anchors/aliases, one document. Regex compilation failures (``re.error``, ``OverflowError``,
+    ``RecursionError``) reject the rule. As a last line of defence ``load_rules`` converts any other ``Exception``
+    raised while loading one file into a ``RuleError`` with ``unexpected=True`` (the original is its
+    ``__cause__``), logs it at ERROR with the traceback, and continues; ``strict=True`` raises ``RuleLoadError``.
+    ``KeyboardInterrupt`` and ``SystemExit`` are never caught, and ``load_rule`` itself never hides a defect.
 
 ATT&CK mapping (``contracts/attack-mapping.yaml``)
     * ``attack_mapping=<path>``: required; a missing or malformed file raises ``AttackMappingError``.
@@ -39,9 +49,35 @@ Decisions where the format documents are silent (recorded in endpoint-core/READM
     * ``scope: lineage(N)`` is parsed and its depth kept, but its traversal meaning (descendants only? ancestors
       and descendants?) is NOT defined by RULE-FORMAT.md and is deliberately not interpreted here. It must be
       confirmed before A3 evaluates threshold rules with that scope. No shipped rule uses it.
-    * A3 notes: Windows string normalization is applied at match time (``NX-ANY-001`` covers both OSes), so
-      operands are kept as authored; regexes are compiled without flags; attacker-controlled strings should be
-      truncated before ``re.search`` (the loader only caps pattern length).
+    * ``ordered`` defaults to True: a sequence rule always carries a bool (never None); other kinds carry None.
+    * Windows-only rules (``os: [windows]``) may spell the closed value sets (``file.operation``,
+      ``network.protocol``, ``network.direction``) in any case, because RULE-FORMAT.md makes ``equals``
+      case-insensitive there; the stored operand is the contract's canonical spelling. Rules that cover Linux, alone
+      or together with Windows, keep exact spelling, so Linux semantics cannot be loosened by accident.
+    * The text operators (prefix_any, endswith_any, contains_any, regex) apply to ``network.dst_ip`` as well,
+      since an address is carried as a string; only the CIDR operators are limited to IP fields.
+
+Regex safety (read before implementing A3)
+    The ``regex`` operator is kept, but Python's ``re`` backtracks and has no timeout, so a pattern such as
+    ``(a+)+$`` takes exponential time on attacker-controlled text (a command line). Loading therefore applies a
+    conservative lexical screen. It is a heuristic, not a guarantee: it refuses nested unbounded repetition,
+    repeated groups whose alternatives may overlap, repeat counts above 1000 (or nested counts multiplying above
+    10,000), verbose patterns and syntax it cannot analyse; atomic groups ``(?>...)`` and possessive quantifiers
+    (Python 3.11+) are the escape hatch. It does NOT catch polynomial blow-ups (``.*.*x``), refuses some harmless
+    patterns, and proves nothing about a pattern it accepts. No shipped rule uses ``regex``.
+    Mandatory safeguards for A3, which the loader cannot provide:
+      * a rule regex must never run on event text in the evaluation path without a hard time bound; input
+        truncation alone is not sufficient (an exponential pattern is already slow at about 30 characters);
+      * a real timeout is an architectural decision that is deliberately NOT made here, with these options:
+        (a) the third-party ``regex`` package (``search(..., timeout=...)``; one new binary dependency, nearly
+        source compatible); (b) RE2 via ``google-re2`` (linear time by construction, new dependency, no
+        back-references or look-around, so some patterns would have to be refused); (c) matching in a worker
+        process killed at a deadline (no dependency, more machinery and latency; the only way to bound stdlib
+        ``re``); (d) refuse to evaluate ``regex`` predicates until one of these is chosen.
+
+A3 notes
+    Windows string normalization (case, slashes) is applied at match time, because ``NX-ANY-001`` covers both
+    OSes, so operands are kept as authored (enum values canonicalized as above); regexes are compiled without flags.
 """
 from __future__ import annotations
 
@@ -56,15 +92,18 @@ from typing import Annotated, Any, Literal, Mapping, NamedTuple, get_args
 
 import yaml
 from nexus_contracts.models import OS, Direction, EventType, FileInfo, Proto, Severity
-from pydantic import (BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr,
-                      StringConstraints, ValidationError, field_validator, model_validator)
+from pydantic import (BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictInt, StringConstraints,
+                      ValidationError, ValidationInfo, field_validator, model_validator)
 from yaml.constructor import ConstructorError
 
 log = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 64 * 1024        # per rule or mapping file
+MAX_YAML_DEPTH = 20               # nested sequences/mappings; the shipped rules reach 6
 MAX_STEPS = 5                     # docs/02-CORRELATION.md section 3: backtracking depth <= 5
 MAX_REGEX_LENGTH = 500
+MAX_REGEX_COUNT = 1000            # largest explicit repeat count, a{n,m}
+MAX_REGEX_COUNT_PRODUCT = 10_000  # nested counted repeats multiply, (a{100}){100}
 MAX_OPERAND_ITEMS = 1000
 MAX_LINEAGE_DEPTH = 10
 MAPPING_FILE_NAME = "attack-mapping.yaml"
@@ -116,21 +155,32 @@ FIELD_PATHS: frozenset[str] = frozenset(_FIELDS)     # plus ``attributes.<key>``
 
 # ---------------------------------------------------------------------------------------------- exceptions
 class RuleError(ValueError):
-    """One rule file was rejected. ``problems`` lists every problem found, each prefixed with its path."""
+    """One rule file was rejected. ``problems`` lists every problem found, each prefixed with its path.
 
-    def __init__(self, source: Path | None, problems: list[str] | tuple[str, ...]) -> None:
+    ``unexpected`` is True when the cause was not a validation problem but an exception the loader did not
+    anticipate (a defect); the original exception is then ``__cause__``. Copyable and picklable.
+    """
+
+    def __init__(self, source: Path | None, problems: list[str] | tuple[str, ...], unexpected: bool = False) -> None:
         self.source = source
         self.problems = tuple(problems)
+        self.unexpected = unexpected
         name = source.name if source is not None else "<rule>"
         super().__init__(f"{name}: " + "; ".join(self.problems))
+
+    def __reduce__(self):
+        return (self.__class__, (self.source, self.problems, self.unexpected))
 
 
 class RuleLoadError(ValueError):
     """``strict=True`` loading found at least one rejected rule (or no rules at all)."""
 
     def __init__(self, errors: tuple[RuleError, ...], message: str = "") -> None:
-        self.errors = errors
+        self.errors = tuple(errors)
         super().__init__(message or f"{len(errors)} rule(s) rejected: " + " | ".join(str(e) for e in errors))
+
+    def __reduce__(self):
+        return (self.__class__, (self.errors, self.args[0]))
 
 
 class AttackMappingError(ValueError):
@@ -140,6 +190,9 @@ class AttackMappingError(ValueError):
         self.path = path
         self.problems = tuple(problems)
         super().__init__(f"ATT&CK mapping {path}: " + "; ".join(self.problems))
+
+    def __reduce__(self):
+        return (self.__class__, (self.path, self.problems))
 
 
 class _Problem(Exception):
@@ -181,17 +234,27 @@ def _read_yaml(path: Path) -> Any:
     except UnicodeDecodeError:
         raise _Problem("file is not valid UTF-8") from None
     try:
-        documents = 0
+        # The event stream is produced iteratively (no recursion), so this pass can bound the nesting depth
+        # before the recursive composer/constructor in ``yaml.load`` ever sees the file.
+        documents = depth = 0
         for event in yaml.parse(text, Loader=yaml.SafeLoader):
             if isinstance(event, yaml.DocumentStartEvent):
                 documents += 1
             if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None) is not None:
                 raise _Problem("YAML anchors and aliases are not allowed")
+            if isinstance(event, (yaml.SequenceStartEvent, yaml.MappingStartEvent)):
+                depth += 1
+                if depth > MAX_YAML_DEPTH:
+                    raise _Problem(f"YAML nesting deeper than {MAX_YAML_DEPTH} levels")
+            elif isinstance(event, (yaml.SequenceEndEvent, yaml.MappingEndEvent)):
+                depth -= 1
         if documents > 1:
             raise _Problem("file holds more than one YAML document")
         return yaml.load(text, Loader=_UniqueKeyLoader)  # noqa: S506 - SafeLoader subclass
     except yaml.YAMLError as e:
         raise _Problem("invalid YAML: " + " ".join(str(e).split())) from None
+    except RecursionError:                      # defence in depth: the depth bound above should make this unreachable
+        raise _Problem("YAML is nested too deeply to parse safely") from None
 
 
 # ---------------------------------------------------------------------------------------------- predicates
@@ -203,13 +266,22 @@ def _field_spec(path: str) -> _Field | None:
     return None
 
 
-def _scalar(spec: _Field, value: Any) -> Any:
-    """Check one operand value against the field it is compared with; returns it unchanged."""
+def _scalar(spec: _Field, value: Any, ci_enums: bool = False) -> Any:
+    """Check one operand value against the field it is compared with and return it.
+
+    The value is returned unchanged, except that for a closed value set (``file.operation``, ``network.protocol``,
+    ``network.direction``) a Windows-only rule (``ci_enums``) may spell it in any case, as RULE-FORMAT.md defines
+    ``equals`` as case-insensitive on Windows; it is then returned in the contract's canonical spelling.
+    """
     if spec.kind == "str":
         if not isinstance(value, str) or not value:
             raise _Problem(f"expected a non-empty string, got {value!r}")
         if spec.values is not None and value not in spec.values:
-            raise _Problem(f"{value!r} is not one of {list(spec.values)}")
+            canonical = {v.lower(): v for v in spec.values}.get(value.lower()) if ci_enums else None
+            if canonical is None:
+                raise _Problem(f"{value!r} is not one of {list(spec.values)}"
+                               + (" (any case is accepted in a Windows-only rule)" if ci_enums else ""))
+            return canonical
     elif spec.kind == "int":
         if isinstance(value, bool) or not isinstance(value, int):
             raise _Problem(f"expected an integer, got {value!r}")
@@ -238,6 +310,186 @@ def _string_list(value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
+# ---------------------------------------------------------------------------------------------- regex screen
+# A conservative, purely lexical screen for the constructs that make Python's backtracking engine take
+# exponential time. It is a HEURISTIC: it refuses some harmless patterns and cannot prove any accepted pattern
+# safe (polynomial blow-ups such as ``.*.*x`` pass). It uses no private ``re`` internals. Runtime safeguards
+# for matching attacker-controlled text are mandatory in A3 (see the module docstring and README).
+_QUANTIFIER = re.compile(r"\{(\d{0,9})(?:(,)(\d{0,9}))?\}")
+_GROUP_FLAGS = re.compile(r"([aiLmsux]*)(?:-([imsx]*))?([:)])")
+_HINT = "; rewrite it without nested repetition, or use an atomic group (?>...) or possessive quantifier (Python 3.11+)"
+
+
+class _Frame:
+    """One open group while scanning: what it contains and how its alternatives look."""
+
+    __slots__ = ("atomic", "unbounded", "weight", "alts", "branch", "branch_plain", "has_alt", "unsafe_alt")
+
+    def __init__(self, atomic: bool = False) -> None:
+        self.atomic = atomic              # (?>...): no backtracking into it, so its inner repetition is harmless
+        self.unbounded = False            # holds a backtrackable variable repetition (*, +, {n,}, {m,n} with n > m)
+        self.weight = 1                   # largest product of nested explicit repeat counts inside
+        self.alts: list[str | None] = []  # alternatives as lower-case literals, None when not purely literal
+        self.branch: list[str] = []
+        self.branch_plain = True
+        self.has_alt = False
+        self.unsafe_alt = False           # this group, or one inside it, has alternatives that may overlap
+
+    def end_branch(self) -> None:
+        self.alts.append("".join(self.branch).lower() if self.branch_plain else None)
+        self.branch, self.branch_plain = [], True
+
+    def safe_alternation(self) -> bool:
+        """Literal alternatives of which none is a prefix of another (an empty one counts), e.g. ``foo|bar``."""
+        if any(a is None for a in self.alts):
+            return False
+        return not any(i != j and b.startswith(a) for i, a in enumerate(self.alts) for j, b in enumerate(self.alts))
+
+
+def _regex_screen(pattern: str) -> str | None:
+    """Return why ``pattern`` is refused, or None. ``pattern`` has already compiled, so its structure is valid."""
+    try:
+        return _scan_regex(pattern)
+    except (IndexError, ValueError):
+        return "the pattern uses syntax this screen cannot analyse safely" + _HINT
+
+
+def _scan_regex(p: str) -> str | None:
+    n, i = len(p), 0
+    stack = [_Frame()]
+    atom: str | _Frame | None = None            # the last item, so a following quantifier knows what it repeats
+
+    def flush() -> None:                         # a closed group that no quantifier followed
+        nonlocal atom
+        if isinstance(atom, _Frame):
+            parent = stack[-1]
+            parent.unbounded = parent.unbounded or (atom.unbounded and not atom.atomic)
+            parent.unsafe_alt = parent.unsafe_alt or atom.unsafe_alt
+            parent.weight = max(parent.weight, atom.weight)
+        atom = None
+
+    while i < n:
+        c = p[i]
+        if c == "\\":
+            flush()
+            i, atom = i + 2, "item"
+            stack[-1].branch_plain = False
+        elif c == "[":
+            flush()
+            j = i + 1
+            j += 1 if p[j] == "^" else 0
+            j += 1 if p[j] == "]" else 0
+            while p[j] != "]":
+                j += 2 if p[j] == "\\" else 1
+            i, atom = j + 1, "item"
+            stack[-1].branch_plain = False
+        elif c == "(":
+            flush()
+            atomic = False
+            if p.startswith("(?#", i):                                   # comment
+                i = p.index(")", i) + 1
+                continue
+            if p.startswith("(?P=", i):                                  # named back-reference
+                i, atom = p.index(")", i) + 1, "item"
+                stack[-1].branch_plain = False
+                continue
+            if p.startswith("(?", i):
+                if p.startswith("(?P<", i):
+                    i = p.index(">", i) + 1
+                elif p.startswith(("(?<=", "(?<!"), i):
+                    i += 4
+                elif p.startswith(("(?:", "(?=", "(?!"), i):
+                    i += 3
+                elif p.startswith("(?>", i):
+                    atomic, i = True, i + 3
+                elif p.startswith("(?(", i):                             # conditional: skip the (id) test
+                    i = p.index(")", i + 3) + 1
+                else:
+                    m = _GROUP_FLAGS.match(p, i + 2)
+                    if m is None:
+                        raise ValueError(p)
+                    if "x" in m.group(1):
+                        return "verbose patterns (?x) are not accepted, they hide structure from this screen"
+                    i = m.end()
+                    if m.group(3) == ")":                                # global flags such as (?i): no group
+                        continue
+            else:
+                i += 1
+            stack.append(_Frame(atomic))
+            atom = None
+        elif c == ")":
+            flush()
+            frame = stack.pop()
+            frame.end_branch()
+            frame.unsafe_alt = frame.unsafe_alt or (frame.has_alt and not frame.safe_alternation())
+            stack[-1].branch_plain = False
+            atom, i = frame, i + 1
+        elif c == "|":
+            flush()
+            stack[-1].has_alt = True
+            stack[-1].end_branch()
+            i += 1
+        else:
+            span = _quantifier(p, i)
+            if span is None:                                             # an ordinary character
+                flush()
+                if c in ".^$":
+                    stack[-1].branch_plain = False
+                else:
+                    stack[-1].branch.append(c)
+                i, atom = i + 1, "item"
+                continue
+            low, high, end = span
+            possessive = end < n and p[end] == "+"                       # a++ , a{2}+ (Python 3.11+)
+            end += 1 if possessive or (end < n and p[end] == "?") else 0
+            unbounded = high is None and not possessive
+            repeats = (high is None or (high > low and high >= 2)) and not possessive   # a variable-length repeat
+            if max(low, high or 0) > MAX_REGEX_COUNT:
+                return f"a repeat count above {MAX_REGEX_COUNT}"
+            count = max(1, high if high is not None else low)
+            frame = stack[-1]
+            if isinstance(atom, _Frame):
+                inner_repeats = atom.unbounded and not atom.atomic
+                if unbounded and inner_repeats:
+                    return "nested repetition (an unbounded repeat of a group that itself repeats)" + _HINT
+                if unbounded and atom.unsafe_alt:
+                    return "a repeated group whose alternatives may overlap" + _HINT
+                count *= atom.weight
+                frame.unbounded = frame.unbounded or repeats or inner_repeats
+                frame.unsafe_alt = frame.unsafe_alt or atom.unsafe_alt
+            else:
+                frame.unbounded = frame.unbounded or repeats
+            if count > MAX_REGEX_COUNT_PRODUCT:
+                return f"nested counted repetition that multiplies to more than {MAX_REGEX_COUNT_PRODUCT}"
+            frame.weight = max(frame.weight, count)
+            frame.branch_plain = False
+            atom, i = None, end
+    flush()
+    return None
+
+
+def _quantifier(p: str, i: int) -> tuple[int, int | None, int] | None:
+    """(minimum, maximum or None for unbounded, end index) if a quantifier starts at ``i``, else None."""
+    c = p[i]
+    if c == "*":
+        return 0, None, i + 1
+    if c == "+":
+        return 1, None, i + 1
+    if c == "?":
+        return 0, 1, i + 1
+    m = _QUANTIFIER.match(p, i) if c == "{" else None
+    if m is None or not (m.group(1) or m.group(2)):                      # "{}" and "{x}" are literal text in Python
+        return None
+    low = int(m.group(1) or 0)
+    if not m.group(2):
+        return low, low, m.end()
+    return low, (int(m.group(3)) if m.group(3) else None), m.end()
+
+
+def _compile_regex(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern)
+
+
 class Predicate(BaseModel):
     """One ``field op operand`` test, with its operand validated and (for regex/CIDR) compiled once."""
 
@@ -249,11 +501,12 @@ class Predicate(BaseModel):
     compiled: Any = None         # re.Pattern for regex; tuple of ip_network for in_cidr / not_in_cidr
 
 
-def _predicate(field: str, spec: _Field, op: Any, operand: Any) -> Predicate:
+def _predicate(field: str, spec: _Field, op: Any, operand: Any, ci_enums: bool = False) -> Predicate:
     if op not in OPERATORS:
         raise _Problem(f"unknown operator {op!r} (allowed: {', '.join(OPERATORS)})")
     compiled: Any = None
-    if op in _STRING_OPS and not (spec.kind == "any" or (spec.kind == "str" and spec.values is None)):
+    # RULE-FORMAT.md: the text operators apply to strings, and an IP address is carried as a string.
+    if op in _STRING_OPS and not (spec.kind in ("any", "ip") or (spec.kind == "str" and spec.values is None)):
         raise _Problem(f"operator {op} needs a free-text field, but {field} is {spec.kind}"
                        + (" with a closed value set" if spec.values else ""))
     if op in _CIDR_OPS and spec.kind != "ip":
@@ -261,17 +514,14 @@ def _predicate(field: str, spec: _Field, op: Any, operand: Any) -> Predicate:
     if op in _NUMBER_OPS and spec.kind not in ("int", "any"):
         raise _Problem(f"operator {op} only applies to a numeric field, not {field}")
     if op == "equals":
-        _scalar(spec, operand)
-        value: Any = operand
+        value: Any = _scalar(spec, operand, ci_enums)
     elif op == "in":
         items = operand
         if not isinstance(items, list) or not items:
             raise _Problem("expected a non-empty list")
         if len(items) > MAX_OPERAND_ITEMS:
             raise _Problem(f"list has {len(items)} items; the limit is {MAX_OPERAND_ITEMS}")
-        for item in items:
-            _scalar(spec, item)
-        value = tuple(items)
+        value = tuple(_scalar(spec, item, ci_enums) for item in items)
     elif op in ("prefix_any", "endswith_any", "contains_any"):
         value = _string_list(operand)
     elif op == "regex":
@@ -280,9 +530,12 @@ def _predicate(field: str, spec: _Field, op: Any, operand: Any) -> Predicate:
         if len(operand) > MAX_REGEX_LENGTH:
             raise _Problem(f"regular expression is {len(operand)} characters; the limit is {MAX_REGEX_LENGTH}")
         try:
-            compiled = re.compile(operand)
-        except re.error as e:
+            compiled = _compile_regex(operand)
+        except (re.error, OverflowError, RecursionError) as e:
             raise _Problem(f"invalid regular expression: {e}") from None
+        reason = _regex_screen(operand)
+        if reason is not None:
+            raise _Problem(f"regular expression rejected: {reason}")
         value = operand
     elif op in _CIDR_OPS:
         networks = []
@@ -299,7 +552,7 @@ def _predicate(field: str, spec: _Field, op: Any, operand: Any) -> Predicate:
     return Predicate(field=field, op=op, operand=value, compiled=compiled)
 
 
-def _compile_where(where: Any, event_type: Any, *, allow_empty: bool = False) -> tuple[Predicate, ...]:
+def _compile_where(where: Any, event_type: Any, *, allow_empty: bool = False, ci_enums: bool = False) -> tuple[Predicate, ...]:
     """YAML ``where`` mapping -> tuple of predicates; raises ValueError listing every problem (one per line)."""
     if where is None and allow_empty:
         return ()
@@ -321,7 +574,7 @@ def _compile_where(where: Any, event_type: Any, *, allow_empty: bool = False) ->
             continue
         for op, operand in ops.items():
             try:
-                out.append(_predicate(field, spec, op, operand))
+                out.append(_predicate(field, spec, op, operand, ci_enums))
             except _Problem as e:
                 problems.append(f"{label}.{op}: {e}")
     if problems:
@@ -344,6 +597,11 @@ def _positive(value: Any) -> Any:
 
 class _Model(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+def _ci_enums(info: ValidationInfo) -> bool:
+    """True while validating a Windows-only rule (see ``load_rule``): enum values may use any case."""
+    return bool(info.context and info.context.get("case_insensitive_enums"))
 
 
 Name = Annotated[str, StringConstraints(strict=True, pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,31}$")]
@@ -377,9 +635,9 @@ class Step(_Model):
 
     @model_validator(mode="before")
     @classmethod
-    def _compile(cls, data: Any) -> Any:
+    def _compile(cls, data: Any, info: ValidationInfo) -> Any:
         if isinstance(data, dict) and "where" in data:
-            data = {**data, "where": _compile_where(data["where"], data.get("event_type"))}
+            data = {**data, "where": _compile_where(data["where"], data.get("event_type"), ci_enums=_ci_enums(info))}
         return data
 
 
@@ -417,11 +675,12 @@ class ThresholdSpec(_Model):
 
     @model_validator(mode="before")
     @classmethod
-    def _compile(cls, data: Any) -> Any:
+    def _compile(cls, data: Any, info: ValidationInfo) -> Any:
         if isinstance(data, dict):
             data = dict(data)
             if "where" in data:
-                data["where"] = _compile_where(data["where"], data.get("event_type"), allow_empty=True)
+                data["where"] = _compile_where(data["where"], data.get("event_type"), allow_empty=True,
+                                               ci_enums=_ci_enums(info))
         return data
 
     @field_validator("scope", mode="before")
@@ -486,9 +745,12 @@ class Rule(_Model):
 
     @model_validator(mode="before")
     @classmethod
-    def _no_source(cls, data: Any) -> Any:
-        if isinstance(data, dict) and "source" in data:
-            raise ValueError("'source' is not a rule key")
+    def _prepare(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "source" in data:
+                raise ValueError("'source' is not a rule key")
+            if data.get("kind") == "sequence" and data.get("ordered") is None:
+                data = {**data, "ordered": True}       # RULE-FORMAT.md: ordered by default; never leave None for A3 to misread
         return data
 
     @model_validator(mode="after")
@@ -523,7 +785,7 @@ class Rule(_Model):
                     problems.append("ordered: only allowed on a sequence rule")
             elif not 2 <= len(self.steps) <= MAX_STEPS:
                 problems.append(f"steps: a sequence rule has 2 to {MAX_STEPS} steps, found {len(self.steps)}")
-            ordered = True if self.ordered is None else self.ordered
+            ordered = self.ordered is not False                  # a sequence always carries a bool (see _prepare)
             index = {name: i for i, name in enumerate(names)}
             for i, step in enumerate(self.steps):
                 if step.lineage is None:
@@ -621,10 +883,8 @@ def _mapping_problems(rule: Rule, mapping: AttackMapping) -> list[str]:
 
 
 def _resolve_mapping(rules_dir: Path, explicit: str | Path | AttackMapping | None) -> AttackMapping | None:
-    if isinstance(explicit, AttackMapping):
-        return explicit
     if explicit is not None:
-        return load_attack_mapping(explicit)
+        return _coerce_mapping(explicit)
     sibling = rules_dir.parent / MAPPING_FILE_NAME
     if sibling.is_file():
         return load_attack_mapping(sibling)
@@ -652,9 +912,22 @@ def _format_errors(error: ValidationError) -> list[str]:
     return list(dict.fromkeys(problems))
 
 
-def load_rule(path: str | Path, *, attack_mapping: AttackMapping | None = None) -> Rule:
-    """Load one rule file; raises ``RuleError`` listing every problem found."""
+def _coerce_mapping(given: str | Path | AttackMapping | None) -> AttackMapping | None:
+    """Accept what ``load_rules`` accepts: a path (loaded now, so a bad one raises ``AttackMappingError``) or a mapping."""
+    if given is None or isinstance(given, AttackMapping):
+        return given
+    return load_attack_mapping(given)
+
+
+def load_rule(path: str | Path, *, attack_mapping: str | Path | AttackMapping | None = None) -> Rule:
+    """Load one rule file; raises ``RuleError`` listing every problem found.
+
+    ``attack_mapping`` is a path or an already loaded ``AttackMapping`` (a bad path raises ``AttackMappingError``);
+    here ``None`` means "do not check", there is no discovery for a single file. Unexpected exceptions are NOT
+    caught: only ``load_rules`` turns them into per-file diagnostics.
+    """
     path = Path(path)
+    attack_mapping = _coerce_mapping(attack_mapping)
     try:
         data = _read_yaml(path)
     except _Problem as e:
@@ -665,8 +938,12 @@ def load_rule(path: str | Path, *, attack_mapping: AttackMapping | None = None) 
         raise RuleError(path, [f"top level must be a mapping, found {type(data).__name__}"])
     problems: list[str] = []
     rule: Rule | None = None
+    # Enum values may use any case only in a rule that applies to Windows alone (RULE-FORMAT.md: equals is
+    # case-insensitive there, case-sensitive on Linux); a rule that also covers Linux keeps exact spelling.
+    oses = data.get("os")
+    windows_only = isinstance(oses, list) and bool(oses) and all(o == "windows" for o in oses)
     try:
-        rule = Rule.model_validate(data)
+        rule = Rule.model_validate(data, context={"case_insensitive_enums": windows_only})
     except ValidationError as e:
         problems += _format_errors(e)
     rule_id = data.get("id")
@@ -719,6 +996,17 @@ def load_rules(rules_dir: str | Path, *, attack_mapping: str | Path | AttackMapp
             loaded.append(load_rule(path, attack_mapping=mapping))
         except RuleError as e:
             errors.append(e)
+        except AttackMappingError:
+            raise
+        except Exception as e:  # noqa: BLE001 - the boundary: one file's defect must not hide the other rules
+            # KeyboardInterrupt and SystemExit derive from BaseException and are deliberately not caught. The
+            # failure is not hidden: it is logged with its traceback, kept as ``__cause__`` and, in strict mode,
+            # raised as RuleLoadError.
+            error = RuleError(path, [f"unexpected {type(e).__name__}: {e} (a loader defect, not a rule problem)"],
+                              unexpected=True)
+            error.__cause__ = e
+            log.error("rule rejected after an unexpected failure: %s", error, exc_info=e)
+            errors.append(error)
 
     # No duplicate-id pass is needed: ``load_rule`` requires the file to be named ``<id>.yaml``, so two files
     # in one directory can never both be accepted with the same id. A stray copy (``NX-WIN-001.copy.yaml``) is
@@ -726,7 +1014,8 @@ def load_rules(rules_dir: str | Path, *, attack_mapping: str | Path | AttackMapp
     accepted = sorted(loaded, key=lambda r: r.id)
 
     for error in errors:
-        log.error("rule rejected: %s", error)
+        if not error.unexpected:                  # unexpected failures were logged with their traceback above
+            log.error("rule rejected: %s", error)
     if mapping is not None:
         for rule_id in sorted(set(mapping.rules) - {r.id for r in accepted} - {e.source.stem for e in errors if e.source}):
             log.warning("ATT&CK mapping lists %s but no rule file for it was found in %s", rule_id, rules_dir)

@@ -88,13 +88,16 @@ rules = load_rules("contracts/rules")                   # RuleSet: .rules (sorte
 rules = load_rules(path, strict=True)                   # raises RuleLoadError if any rule is rejected or none were found
 rules = load_rules(path, attack_mapping="contracts/attack-mapping.yaml")   # explicit mapping: required
 rule = load_rule("contracts/rules/NX-WIN-001.yaml")     # one file; raises RuleError listing every problem
+rule = load_rule(path, attack_mapping=mapping_or_path)  # a path or an already loaded AttackMapping, as in load_rules
 ```
 `Rule` fields mirror the YAML: `id, version, title, kind, os, severity, technique_ids, references, window_seconds,
 ordered, context, steps, threshold, response, source`. A `Step` has `name, event_type, where, lineage`; `where` is a tuple
 of `Predicate(field, op, operand, compiled)` (several operators on one field are separate predicates, all ANDed);
 `Lineage(relation, of, max_depth, include_self)`; `ThresholdSpec(event_type, where, scope, distinct_field, group_by,
 min_distinct, window_seconds)` with `scope = Scope(kind, depth)`; `ResponseSpec(action, target_step)`. All models are
-frozen and every collection is a tuple.
+frozen and every collection is a tuple. `ordered` is always a bool on a sequence (omitted means `True`) and `None` on
+single and threshold rules, so an evaluator can never read an omitted value as "unordered". `RuleError`,
+`RuleLoadError` and `AttackMappingError` can be copied and pickled.
 
 **Policy.** A rejected rule is logged at ERROR (file name plus the path of every problem), listed in `RuleSet.errors`,
 and the other rules still load; `strict=True` raises one `RuleLoadError` instead. A missing rules directory, and a
@@ -102,6 +105,13 @@ required-but-missing or malformed ATT&CK mapping, raise immediately in both mode
 `AttackMappingError`). A file must be named `<id>.yaml`, so duplicate ids cannot load: a stray copy is rejected naming
 the file it should be, and the correctly named original stays authoritative. Within one rule, field-level problems are
 reported first and cross-field problems (lineage targets, kind consistency, response) once those are fixed.
+
+**Resilience.** One file can never abort a load. Files are limited to 64 KiB, YAML nesting to 20 levels (checked on the
+parser's non-recursive event stream before the recursive constructor runs), no anchors or aliases, one document;
+regex compilation failures (`re.error`, `OverflowError`, `RecursionError`) reject the rule. As a last line of defence
+`load_rules` turns any other `Exception` from one file into a `RuleError` with `unexpected=True` (the original is its
+`__cause__`), logs it with its traceback and continues; `strict=True` raises `RuleLoadError`. `KeyboardInterrupt` and
+`SystemExit` are never caught, and `load_rule` itself does not hide a defect.
 
 **ATT&CK mapping.** An explicit `attack_mapping=` is always required. Otherwise `<rules dir>/../attack-mapping.yaml` is
 used when it exists. When it does not exist the check is skipped for an independent directory, but never for the
@@ -113,18 +123,39 @@ requires `max_descendant_depth` and `incident_window_seconds` (`max_ancestors` d
 for single/sequence and forbidden for threshold; `ordered` only on sequences (default true); a single rule has one step and
 a sequence 2 to 5; every step needs a non-empty `where`; field paths are the `RULE-FORMAT.md` list plus `attributes.<key>`
 and must suit the step's `event_type`; operators must suit the field (text operators on free text, CIDR on `network.dst_ip`,
-`gte`/`lte` on ports) and closed-set values (`file.operation`, `network.direction`, `network.protocol`) are checked against
-the contract; CIDRs must have no host bits set; regexes are at most 500 characters; lineage targets must be existing,
+`gte`/`lte` on ports; the text operators also work on `network.dst_ip`) and closed-set values (`file.operation`, `network.direction`, `network.protocol`) are checked against
+the contract (a Windows-only rule may spell them in any case, since `equals` is case-insensitive there, and the stored value is
+the canonical spelling; a rule that covers Linux must match exactly); CIDRs must have no host bits set; regexes are at most 500
+characters and pass the screen below; lineage targets must be existing,
 other steps (earlier ones in an ordered rule, no cycles otherwise) and `descendant_of` needs `max_depth` 1 to 10;
 `response.target_step` must be a step, the rule's severity at least `high`, and thresholds cannot respond. YAML is read
-with a safe loader that rejects duplicate keys, anchors/aliases, extra documents, files over 64 KiB and non-UTF-8 text.
+with a safe loader that rejects duplicate keys, anchors/aliases, extra documents, deep nesting, files over 64 KiB and
+non-UTF-8 text.
+
+### Regex safety (read before implementing A3)
+The `regex` operator is kept, but Python's `re` backtracks and has **no timeout**: `(a+)+$` needs seconds on 26 characters of
+attacker-controlled text and doubles with each one. Loading applies a conservative lexical screen. It is a **heuristic, not a
+guarantee** (it uses no private `re` internals): it refuses nested unbounded repetition (`(a+)+`, `(.*a)*`, `(\d+\.)+`),
+repeated groups whose alternatives may overlap (`(a|ab)*`, `(a|b+)+`; `(foo|bar)+` is fine), repeat counts above 1000 or
+nested counts multiplying above 10,000, verbose `(?x)` patterns and syntax it cannot analyse. Atomic groups `(?>...)` and
+possessive quantifiers (Python 3.11+) are the escape hatch. It does **not** catch polynomial blow-ups such as `.*.*x`, it
+refuses some harmless patterns, and it proves nothing about an accepted one. No shipped rule uses `regex`.
+
+**Mandatory for A3** (the loader cannot provide these): never run a rule regex on event text in the evaluation path without
+a hard time bound; **input truncation alone is not sufficient**, since an exponential pattern is already slow at about 30
+characters. A real timeout is an architectural decision that is deliberately not taken here:
+* **(a) the third-party `regex` package** with `search(..., timeout=...)`: one new binary dependency, nearly source compatible;
+* **(b) RE2** (`google-re2`): linear time by construction, new dependency, but no back-references or look-around, so some
+  accepted patterns would have to be refused;
+* **(c) a worker process** killed at a deadline: no dependency, but more machinery and latency; the only way to bound stdlib `re`;
+* **(d) refuse to evaluate `regex` predicates** until one of the above is chosen.
 
 ### Known limitations and open questions (A2)
 * **`scope: lineage(N)`** is parsed and its depth kept, but `RULE-FORMAT.md` does not define what it traverses
   (descendants only, or ancestors and descendants). Nothing here interprets it, and **its exact evaluation semantics must
   be confirmed before A3 evaluates threshold rules with that scope**. No shipped rule uses it.
 * Windows string normalization (case, slashes) is applied at match time in A3, not here, because `NX-ANY-001` covers both
-  OSes; operands are kept as authored. Regexes carry no flags and run with `re.search`: A3 should truncate
-  attacker-controlled strings (command lines) before matching, since the loader only limits pattern length.
+  OSes; operands are kept as authored (enum values canonicalized as described). Regexes carry no flags and run with
+  `re.search`; see **Regex safety** above for what A3 must add.
 * Five of the seven shipped rules have no sibling fixtures yet (`RULE-FORMAT.md` asks for them); they are an A3 deliverable.
 * The ATT&CK check mirrors `tools/validate_fixtures.py` (exact ordered list equality).

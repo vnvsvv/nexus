@@ -370,7 +370,6 @@ PREDICATES = [
     ("file operation outside the contract", _where(1, "file.operation", {"equals": "readd"}), ["'readd' is not one of"]),
     ("file operation in a list", _where(1, "file.operation", {"in": ["create", "bogus"]}), ["'bogus' is not one of"]),
     ("direction outside the contract", _where(2, "network.direction", {"equals": "outgoing"}), ["'outgoing' is not one of ['outbound', 'inbound']"]),
-    ("protocol in the wrong case", _where(2, "network.protocol", {"equals": "tcp"}), ["'tcp' is not one of ['TCP', 'UDP']"]),
     ("port above range", _where(2, "network.dst_port", {"equals": 70000}), ["outside 0..65535"]),
     ("port negative", _where(2, "network.dst_port", {"in": [80, -1]}), ["outside 0..65535"]),
     ("port as a string", _where(2, "network.dst_port", {"equals": "80"}), ["expected an integer"]),
@@ -811,3 +810,311 @@ def test_a_mapping_directory_instead_of_a_file_is_not_silently_skipped(tmp_path)
 
 def test_the_rule_set_type_is_exposed():
     assert isinstance(load_rules(RULES), RuleSet)
+
+
+# ================================================================== review follow-up (C1, C2, I1-I5)
+import copy as _copy  # noqa: E402
+import pickle  # noqa: E402
+
+
+def deep_yaml(depth: int) -> str:
+    return "id: NX-WIN-002\nx: " + "[" * depth + "]" * depth + "\n"
+
+
+# ------------------------------------------------------------------ C1: one bad file must never abort the load
+@pytest.mark.parametrize("depth", [40, 5_000, 30_000])
+def test_deeply_nested_yaml_is_a_controlled_rejection(tmp_path, depth):
+    err = yaml_rejected(tmp_path, deep_yaml(depth), "nesting deeper than")
+    assert isinstance(err, RuleError) and not err.unexpected
+
+
+def test_nesting_up_to_the_documented_limit_is_not_a_nesting_error(tmp_path):
+    with pytest.raises(RuleError) as caught:
+        load_rule(raw(tmp_path, deep_yaml(15), "NX-WIN-002.yaml"))
+    assert "nesting deeper than" not in str(caught.value)
+    assert load_rule(RULES / "NX-WIN-001.yaml").id == "NX-WIN-001"            # the deepest shipped rule is far below the limit
+
+
+def test_a_deeply_nested_mapping_file_is_a_controlled_mapping_failure(tmp_path):
+    rules_dir, mapping_path = canonical_layout(tmp_path)
+    mapping_path.write_text("techniques: " + "[" * 5_000 + "]" * 5_000 + "\n", encoding="utf-8")
+    with pytest.raises(AttackMappingError, match="nesting deeper than"):
+        load_rules(rules_dir)
+
+
+def test_a_pathological_file_does_not_abort_the_directory_load(tmp_path, caplog):
+    directory = make_dir(tmp_path)
+    (directory / "NX-WIN-002.yaml").write_text(deep_yaml(30_000), encoding="utf-8")
+    with caplog.at_level(logging.ERROR, logger="nexus_endpoint_core.rules"):
+        result = load_rules(directory)
+    assert [r.id for r in result] == [i for i in SHIPPED if i != "NX-WIN-002"]
+    assert [e.source.name for e in result.errors] == ["NX-WIN-002.yaml"] and "nesting deeper than" in str(result.errors[0])
+    assert any("NX-WIN-002.yaml" in r.getMessage() for r in caplog.records)
+    with pytest.raises(RuleLoadError) as strict:
+        load_rules(directory, strict=True)
+    assert [e.source.name for e in strict.value.errors] == ["NX-WIN-002.yaml"]
+
+
+@pytest.mark.parametrize("pattern", ["a{99999999999}", "x{1,99999999999}"])
+def test_regex_compile_overflow_is_a_rejection_not_a_crash(tmp_path, pattern):
+    rejected(tmp_path, "NX-WIN-001", _where(0, "command_line", {"regex": pattern}), "invalid regular expression")
+
+
+@pytest.mark.parametrize("exc", [RecursionError("too deep"), OverflowError("too big"), re.error("bad")])
+def test_every_regex_compile_failure_is_a_rejection(tmp_path, monkeypatch, exc):
+    def boom(pattern):
+        raise exc
+    monkeypatch.setattr(rules_module, "_compile_regex", boom)
+    rejected(tmp_path, "NX-WIN-001", _where(0, "command_line", {"regex": "abc"}), "invalid regular expression")
+
+
+def _break_validation(monkeypatch, exception: BaseException, rule_id: str = "NX-WIN-001") -> None:
+    real = Rule.model_validate
+
+    def boom(data, *args, **kwargs):
+        if isinstance(data, dict) and data.get("id") == rule_id:
+            raise exception
+        return real(data, *args, **kwargs)
+    monkeypatch.setattr(Rule, "model_validate", staticmethod(boom))
+
+
+def test_an_unexpected_failure_in_one_file_is_diagnosed_and_the_rest_still_load(tmp_path, monkeypatch, caplog):
+    directory = make_dir(tmp_path)
+    bug = RuntimeError("simulated loader bug")
+    _break_validation(monkeypatch, bug)
+    with caplog.at_level(logging.ERROR, logger="nexus_endpoint_core.rules"):
+        result = load_rules(directory)
+    assert [r.id for r in result] == [i for i in SHIPPED if i != "NX-WIN-001"]
+    (error,) = result.errors
+    assert error.unexpected is True and error.source.name == "NX-WIN-001.yaml" and error.__cause__ is bug
+    assert "unexpected RuntimeError" in str(error) and "simulated loader bug" in str(error)
+    logged = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(logged) >= 1 and any(r.exc_info and r.exc_info[1] is bug for r in logged)     # the traceback is not hidden
+
+
+def test_strict_mode_fails_with_rule_load_error_on_an_unexpected_failure(tmp_path, monkeypatch):
+    directory = make_dir(tmp_path)
+    _break_validation(monkeypatch, ValueError("odd"))
+    with pytest.raises(RuleLoadError) as caught:
+        load_rules(directory, strict=True)
+    assert caught.value.errors[0].unexpected and "unexpected ValueError" in str(caught.value)
+
+
+@pytest.mark.parametrize("exception", [KeyboardInterrupt(), SystemExit(3)])
+def test_interrupts_and_exits_are_never_swallowed(tmp_path, monkeypatch, exception):
+    directory = make_dir(tmp_path)
+    _break_validation(monkeypatch, exception)
+    with pytest.raises(type(exception)):
+        load_rules(directory)
+    with pytest.raises(type(exception)):
+        load_rules(directory, strict=True)
+
+
+def test_load_rule_itself_does_not_hide_programming_errors(tmp_path, monkeypatch):
+    _break_validation(monkeypatch, RuntimeError("bug"))
+    with pytest.raises(RuntimeError, match="bug"):
+        load_rule(RULES / "NX-WIN-001.yaml")
+
+
+# ------------------------------------------------------------------ C2: omitted `ordered` means ordered
+def test_an_omitted_ordered_on_a_sequence_is_true(tmp_path):
+    for base in ("NX-LIN-001", "NX-LIN-003", "NX-WIN-001"):
+        assert loaded(tmp_path, base, drop("ordered")).ordered is True
+    assert loaded(tmp_path, "NX-WIN-001", put("ordered", value=None)).ordered is True       # an explicit null is "not stated"
+    assert loaded(tmp_path, "NX-WIN-001", put("ordered", value=False)).ordered is False
+
+
+def test_ordering_is_a_bool_for_sequences_and_none_otherwise():
+    for rule in load_rules(RULES):
+        if rule.kind == "sequence":
+            assert rule.ordered is True or rule.ordered is False
+        else:
+            assert rule.ordered is None
+    assert [r.id for r in load_rules(RULES) if r.kind == "sequence" and r.ordered] == ["NX-LIN-001", "NX-LIN-003", "NX-WIN-001"]
+
+
+def test_ordering_does_not_apply_to_single_or_threshold_rules(tmp_path):
+    assert loaded(tmp_path, "NX-WIN-002", lambda d: None).ordered is None
+    assert loaded(tmp_path, "NX-LIN-002", lambda d: None).ordered is None
+    rejected(tmp_path, "NX-WIN-002", put("ordered", value=False), "ordered: only allowed on a sequence")
+
+
+# ------------------------------------------------------------------ I1: regex safety (a conservative screen, not a guarantee)
+DANGEROUS_REGEXES = [
+    ("nested plus", r"(a+)+$"), ("nested star", r"(a*)*"), ("star of plus", r"(a+)*b"), ("plus of star", r"(a*)+"),
+    ("dot star in a repeated group", r"(.*a)+"), ("deeper nesting", r"((a+)b)+"), ("non-capturing", r"(?:x+)+y"),
+    ("named group", r"(?P<n>a+)+"), ("counted unbounded", r"(a{2,})+"), ("braced unbounded outer", r"(a+){2,}"),
+    ("identical alternatives", r"(a|a)+"), ("alternative that is a prefix of another", r"(a|ab)*c"),
+    ("alternative with a pattern", r"(a|b+)+"), ("alternation with a nested group", r"((a)|b)*"),
+    ("separated nested repetition", r"(\d+\.)+x"),                                       # conservative: safe in practice, still refused
+    ("counted bomb", r"(a{1000}){1000}"), ("single huge count", r"a{5000}"), ("huge count range", r"a{1,2000}"),
+    ("verbose flag", r"(?x) a b"), ("scoped verbose flag", r"(?x:a b)"),
+    ("nested in a lookahead group", r"((?=a+)a+)+"),
+    ("overlap hidden in a nested group", r"((?:a|a))*c"), ("overlap hidden, braced outer", r"((?:a|a)){2,}c"),
+    ("variable count inside an unbounded repeat", r"(a{1,3})+$"), ("variable count on dot", r"(.{1,3})*b$"),
+    ("nested variable counts", r"((a|ab){1,3}){2,}c"), ("variable count with overlap", r"(a{1,3}a(?:a|a)?){2,}c"),
+    ("overlap hidden in a bounded inner repeat", r"((?:a|a)?)*c"),
+]
+
+
+@pytest.mark.parametrize("label, pattern", DANGEROUS_REGEXES, ids=[c[0] for c in DANGEROUS_REGEXES])
+def test_dangerous_regexes_are_refused(tmp_path, label, pattern):
+    err = rejected(tmp_path, "NX-WIN-001", _where(0, "command_line", {"regex": pattern}), "regular expression rejected")
+    assert "command_line" in str(err)
+
+
+ACCEPTED_REGEXES = [
+    r"-e(nc)?\s", r"^powershell(\.exe)?$", r"(?i)-ep\s+bypass", r"foo|bar", r"(foo|bar)+", r"(foo|bar|baz)*x",
+    r"[a-z]+\.exe$", r"\bcmd\b.*\bwhoami\b", r"\d{1,3}(\.\d{1,3}){3}", r"(?:ab){2,5}", r"(\w+)@(\w+)\.com", r"a{1000}", r"\(a+\)+",
+    r"[(]+[)]+", r"(a?)", r"^(?!.*bad).*$", r"(?<=x)y+", r"(?:abc)?def", r"(?>a+)+$", r"(a++)+b", r"x*+y", r"(?#note)z",
+    r"[a-c]{2}[x-z]{3,4}", r"(\d{1,3}\.){3}\d{1,3}", r"(foo|bar){1,3}", r"(?:ab){1,3}x", r"a{1,3}b{2,4}",
+]
+
+
+@pytest.mark.parametrize("pattern", ACCEPTED_REGEXES)
+def test_ordinary_regexes_still_load(tmp_path, pattern):
+    rule = loaded(tmp_path, "NX-WIN-001", _where(0, "command_line", {"regex": pattern}))
+    compiled = next(p.compiled for p in rule.steps[0].where if p.op == "regex")
+    assert compiled.pattern == pattern
+
+
+def test_the_screen_is_documented_as_a_heuristic_with_mandatory_runtime_safeguards():
+    doc = rules_module.__doc__
+    for phrase in ("heuristic", "not a guarantee", "timeout", "truncation alone"):
+        assert phrase in doc, phrase
+    readme = (ROOT / "endpoint-core" / "README.md").read_text(encoding="utf-8")
+    assert "Regex safety" in readme and "re2" in readme.lower() and "timeout" in readme
+
+
+# ------------------------------------------------------------------ I2: string operators work on IP text
+@pytest.mark.parametrize("op, operand", [("prefix_any", ["192.168."]), ("endswith_any", [".1"]), ("contains_any", ["10."]),
+                                         ("regex", r"^10\.\d+")])
+def test_string_operators_apply_to_destination_ip_text(tmp_path, op, operand):
+    rule = loaded(tmp_path, "NX-WIN-001", _where(2, "network.dst_ip", {op: operand}))
+    assert any(p.field == "network.dst_ip" and p.op == op for p in rule.steps[2].where)
+
+
+def test_cidr_operators_stay_limited_to_ip_fields(tmp_path):
+    rejected(tmp_path, "NX-WIN-001", _where(0, "binary", {"not_in_cidr": ["10.0.0.0/8"]}), "only applies to an IP address field")
+    rejected(tmp_path, "NX-WIN-001", _where(2, "network.dst_port", {"in_cidr": ["10.0.0.0/8"]}), "only applies to an IP address field")
+    rejected(tmp_path, "NX-WIN-001", _where(2, "network.dst_port", {"prefix_any": ["80"]}), "needs a free-text field")
+
+
+# ------------------------------------------------------------------ I3: case-insensitive enums for Windows-only rules
+def test_a_windows_only_rule_accepts_case_variations_and_stores_the_canonical_value(tmp_path):
+    rule = loaded(tmp_path, "NX-WIN-001", lambda d: (
+        d["steps"][2]["where"].update({"network.protocol": {"equals": "tcp"}, "network.direction": {"equals": "Outbound"}}),
+        d["steps"][1]["where"].update({"file.operation": {"in": ["Create", "WRITE"]}})))
+    ops = {(p.field, p.op): p.operand for s in rule.steps for p in s.where}
+    assert ops[("network.protocol", "equals")] == "TCP" and ops[("network.direction", "equals")] == "outbound"
+    assert ops[("file.operation", "in")] == ("create", "write")
+
+
+def test_a_windows_only_threshold_canonicalizes_too(tmp_path):
+    rule = loaded(tmp_path, "NX-WIN-003", put("threshold", "where", value={"network.direction": {"equals": "OUTBOUND"}}))
+    assert [(p.field, p.operand) for p in rule.threshold.where] == [("network.direction", "outbound")]
+
+
+def test_a_windows_only_rule_still_rejects_values_that_are_not_valid_in_any_case(tmp_path):
+    rejected(tmp_path, "NX-WIN-001", _where(2, "network.protocol", {"equals": "tcpp"}),
+             "is not one of ['TCP', 'UDP'] (any case is accepted in a Windows-only rule)")
+    rejected(tmp_path, "NX-WIN-001", _where(1, "file.operation", {"equals": "readd"}), "is not one of")
+
+
+@pytest.mark.parametrize("base, step, field, value", [
+    ("NX-LIN-001", 3, "network.direction", "Outbound"), ("NX-LIN-001", 2, "file.operation", "Read"),
+    ("NX-LIN-003", 1, "network.protocol", "tcp"),
+])
+def test_linux_only_rules_keep_exact_case_semantics(tmp_path, base, step, field, value):
+    rejected(tmp_path, base, put("steps", step, "where", field, value={"equals": value}), "is not one of")
+
+
+def test_cross_platform_rules_are_not_loosened(tmp_path):
+    def make(d):
+        d["steps"][0]["event_type"] = "network_connect"
+        d["steps"][0]["where"] = {"network.protocol": {"equals": "tcp"}}
+    rejected(tmp_path, "NX-ANY-001", make, "is not one of ['TCP', 'UDP']")
+
+    def exact(d):
+        make(d)
+        d["steps"][0]["where"] = {"network.protocol": {"equals": "TCP"}}
+    assert loaded(tmp_path, "NX-ANY-001", exact).steps[0].where[0].operand == "TCP"
+
+
+# ------------------------------------------------------------------ I4: load_rule accepts the same mapping forms as load_rules
+def test_load_rule_accepts_a_path_a_string_or_a_loaded_mapping(tmp_path):
+    target = RULES / "NX-WIN-001.yaml"
+    for given in (MAPPING, str(MAPPING), load_attack_mapping(MAPPING)):
+        assert load_rule(target, attack_mapping=given).technique_ids == ("T1059.001", "T1074.001", "T1105")
+    mismatch = tmp_path / "mapping.yaml"
+    shutil.copy(MAPPING, mismatch)
+    edit_mapping(mismatch, lambda m: m["rules"].__setitem__("NX-WIN-001", ["T1105"]))
+    for given in (mismatch, str(mismatch), load_attack_mapping(mismatch)):
+        with pytest.raises(RuleError, match="differ from the ATT&CK mapping"):
+            load_rule(target, attack_mapping=given)
+
+
+def test_load_rule_reports_a_bad_mapping_path_like_load_rules(tmp_path):
+    with pytest.raises(AttackMappingError, match="file not found"):
+        load_rule(RULES / "NX-WIN-001.yaml", attack_mapping=tmp_path / "missing.yaml")
+    broken = tmp_path / "broken.yaml"
+    broken.write_text("techniques: {}\n", encoding="utf-8")
+    with pytest.raises(AttackMappingError):
+        load_rule(RULES / "NX-WIN-001.yaml", attack_mapping=broken)
+
+
+# ------------------------------------------------------------------ I5: exceptions survive copy and pickle
+def _roundtrips(error):
+    return {"deepcopy": _copy.deepcopy(error), "copy": _copy.copy(error), "pickle": pickle.loads(pickle.dumps(error)),
+            "pickle-v2": pickle.loads(pickle.dumps(error, protocol=2))}
+
+
+def test_rule_error_survives_copy_and_pickle(tmp_path):
+    with pytest.raises(RuleError) as caught:
+        load_rule(raw(tmp_path, "id: NX-WIN-001\nseverity: urgent\n", "NX-WIN-001.yaml"))
+    original = caught.value
+    unexpected = RuleError(tmp_path / "NX-WIN-002.yaml", ["unexpected RuntimeError: boom"], unexpected=True)
+    for error in (original, unexpected):
+        for how, clone in _roundtrips(error).items():
+            assert type(clone) is RuleError, how
+            assert (clone.source, clone.problems, clone.unexpected, str(clone)) == (error.source, error.problems, error.unexpected, str(error)), how
+
+
+def test_attack_mapping_error_survives_copy_and_pickle(tmp_path):
+    error = AttackMappingError(tmp_path / "attack-mapping.yaml", ["techniques: required", "rules: required"])
+    for how, clone in _roundtrips(error).items():
+        assert (type(clone), clone.path, clone.problems, str(clone)) == (AttackMappingError, error.path, error.problems, str(error)), how
+
+
+def test_rule_load_error_survives_copy_and_pickle(tmp_path):
+    inner = RuleError(tmp_path / "NX-WIN-001.yaml", ["severity: bad"])
+    error = RuleLoadError((inner,))
+    for how, clone in _roundtrips(error).items():
+        assert type(clone) is RuleLoadError and str(clone) == str(error), how
+        assert [(e.source, e.problems) for e in clone.errors] == [(inner.source, inner.problems)], how
+    assert str(_copy.deepcopy(RuleLoadError((), "no rules found in x"))) == "no rules found in x"
+
+
+# ------------------------------------------------------------------ cleanup: the `in` operand cap
+def test_the_in_operand_list_cap(tmp_path):
+    names = [f"c{i}.exe" for i in range(1000)]
+    assert len(loaded(tmp_path, "NX-WIN-001", _where(0, "binary", {"in": names})).steps[0].where) >= 1
+    rejected(tmp_path, "NX-WIN-001", _where(0, "binary", {"in": names + ["one-too-many.exe"]}), "the limit is 1000")
+
+
+# ------------------------------------------------------------------ last lines of defence, exercised by injection
+def test_a_recursion_error_inside_the_yaml_constructor_is_still_a_controlled_rejection(tmp_path, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RecursionError("simulated")
+    monkeypatch.setattr(rules_module.yaml, "load", boom)
+    err = yaml_rejected(tmp_path, SHIPPED_TEXT, "nested too deeply to parse safely")
+    assert not err.unexpected
+
+
+@pytest.mark.parametrize("exc", [IndexError("x"), ValueError("y")])
+def test_a_pattern_the_screen_cannot_analyse_is_refused_not_accepted(tmp_path, monkeypatch, exc):
+    def boom(pattern):
+        raise exc
+    monkeypatch.setattr(rules_module, "_scan_regex", boom)
+    rejected(tmp_path, "NX-WIN-001", _where(0, "command_line", {"regex": "abc"}),
+             "regular expression rejected", "cannot analyse safely")
