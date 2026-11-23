@@ -4,7 +4,7 @@ Every scenario script writes a **ground-truth manifest** (`/lab/manifests/<scena
 
 | ID | Endpoint | Story | Expected rule | Expected network side | Response |
 |---|---|---|---|---|---|
-| L1 | Linux | `python3` → `bash` → `cat /lab/protected/confidential.txt` → `curl` POST to Windows VM `:8443` (a Python `http.server` with a tiny upload handler) | NX-LIN-001 | matched connection; flow likely **benign** by ML — shown anyway | manual terminate (denied: curl not allowlisted) — demonstrates the gate |
+| L1 | Linux | `python3` starts one Bash process. Bash runs `cat` on the lab canary and then runs `curl` to POST a fixed marker to the Windows VM on `:8443`. | NX-LIN-001 | matched connection; flow likely **benign** by ML — shown anyway | manual terminate (denied: curl not allowlisted) — demonstrates the gate |
 | L2 | Linux | `/lab/bin/beacon-sim` (a 20-line Python script copied there, compiled with `pyinstaller` or run as script) connects to Windows VM `:9000` every 5 s | NX-LIN-003 | matched; ML verdict whatever it is | **automatic terminate** (allowlisted path; dry_run=false on the lab VM) |
 | L3 | Linux | one process connects to 30 sequential ports on the Windows VM (a Python loop; no third-party tools) | NX-LIN-002 | 30 matched gateway connections; several flows may be flagged suspicious → standalone alerts linked to the incident | none |
 | W1 | Windows | `cmd` → `powershell -ExecutionPolicy Bypass -File w1_stage.ps1` → writes `C:\Lab\staging\report.zip` → `Invoke-WebRequest` to Linux VM `:8080` | NX-WIN-001 | matched; gap `FILE_READ_NOT_OBSERVABLE_ON_WINDOWS` shown | manual terminate (denied) |
@@ -16,6 +16,31 @@ Run order for the final demo: L1 (story), W1 (cross-OS parity + gaps), L2 (autom
 Benign noise generator (`noise.sh` / `noise.ps1`): loops of `ls`/`dir`, `grep`/`Select-String`, file copies and deletes in a work folder (`noise.ps1`: `C:\Lab\noise`, or `-WorkDir $env:TEMP\nexus-noise` for extra lab realism), HTTP GETs to the other VM's web server, an occasional DNS lookup of `noise.nexus.test`, every 2–10 s, for the duration of an evaluation run. Expected: zero incidents.
 
 `noise.ps1` (Windows PowerShell 5.1, unelevated, **not yet run on a real Windows machine**) writes `C:\Lab\manifests\NOISE-<start>.json` with `start_utc`, `end_utc`, `expected_incidents: 0` and counters, so `nexus-eval noise --window START END` can use it. It avoids `-ExecutionPolicy Bypass`, `-enc`, `C:\Lab\staging`, `C:\Lab\bin` and many-port connections so NX-WIN-001/002/003 stay quiet. Run: `Unblock-File C:\Lab\scenarios\noise.ps1; powershell -NoProfile -ExecutionPolicy RemoteSigned -File C:\Lab\scenarios\noise.ps1 -Minutes 60`. `noise.sh` still lacks the window manifest; Omar adds it in the same format.
+
+## L1 on the isolated lab
+
+On the Linux VM, create the dedicated canary in the existing
+`/lab/protected/` directory. Use the ordinary lab Python 3.11 or 3.12
+interpreter and an account that can read the canary and write to
+`/lab/manifests`.
+
+```bash
+printf 'NEXUS L1 test canary\n' > /lab/protected/nexus-l1-canary.txt
+python3 /lab/scenarios/l1_stage_and_send.py --isolated-lab
+```
+
+Start the approved HTTP receiver on the Windows lab VM before running L1.
+It should accept `POST /upload` on `192.168.20.10:8443` and acknowledge
+the literal text `NEXUS-L1-SYNTHETIC`. Curl sends that marker as its entire
+body. Cat discards the canary bytes before Bash starts curl.
+
+The private manifest records observed child PIDs and their spawning parent,
+the root executable and parent PID, and UTC bounds for the read and request.
+It records process start ticks where procfs supplies them. The connection
+entry uses curl's actual local and remote socket values and HTTP status
+when available.
+The bounds bracket the observations. The Tetragon evidence supplies the
+kernel event timestamps for the incident.
 
 ## W1 on the laptop (dev Sysmon profile)
 Only for adapter development; evaluation numbers still come from the lab VM. After the verification matrix in `lab/sysmon/README.md` has passed:
