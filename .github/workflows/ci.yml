@@ -12,6 +12,8 @@ jobs:
       - run: python tools/validate_fixtures.py
       - run: pytest -q tests/
       - run: pytest -q endpoint-core
+      - name: Linux endpoint regression tests
+        run: PYTHONPATH=.:endpoint-linux pytest -q endpoint-linux/tests
       - run: python tools/lint_sysmon_config.py
       - run: python tools/check_samples.py
       # Each owner adds a job for their package when it exists:

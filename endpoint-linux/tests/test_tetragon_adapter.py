@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from nexus_endpoint_core import ProcessGraph
 from tetragon_adapter import TetragonAdapter
 
 from nexus_contracts import HostEvent, validate_against_schema
@@ -589,21 +590,140 @@ def test_synthetic_incomplete_observation_does_not_supply_fallback_identity(
     assert json.loads(diagnostic["raw_jsonl"]) == read
 
 
-def test_synthetic_procfs_placeholder_and_missing_required_fields(
-    tmp_path: Path,
+@pytest.mark.parametrize("parent_source", ["both", "process", "parent"])
+def test_synthetic_procfs_placeholder_keeps_observed_parent(
+    tmp_path: Path, parent_source: str
 ) -> None:
     record, *_ = synthetic_records()
     body = record["process_exec"]
     proc = body["process"]
     proc["flags"] = "procFS rootCWD"
+    if parent_source == "process":
+        body["parent"].pop("exec_id")
+    elif parent_source == "parent":
+        proc.pop("parent_exec_id")
+
     event = replay(tmp_path, record)[0]
-    assert event.attributes["identity_resolution"] == "native"
-    body.pop("parent")
+    assert event.attributes["identity_resolution"] == "placeholder"
+    assert event.attributes["placeholder"] is True
+    assert event.parent_process_instance_id == "linux-vm-01:synthetic-parent"
+    assert event.ppid == 8400
+    assert_contract([event])
+
+
+@pytest.mark.parametrize("ppid", [None, 8400])
+def test_synthetic_procfs_placeholder_without_parent_id(
+    tmp_path: Path, ppid: int | None
+) -> None:
+    record, *_ = synthetic_records()
+    body = record["process_exec"]
+    proc = body["process"]
+    proc["flags"] = "procFS rootCWD"
     proc.pop("parent_exec_id")
+    if ppid is None:
+        body.pop("parent")
+    else:
+        body["parent"].pop("exec_id")
+
     event = replay(tmp_path, record)[0]
     assert event.attributes["identity_resolution"] == "placeholder"
     assert event.attributes["placeholder"] is True
     assert event.parent_process_instance_id is None
+    assert event.ppid == ppid
+    assert_contract([event])
+    graph = ProcessGraph()
+    node = graph.apply(event)
+    assert node is not None and node.placeholder
+    assert node.parent_process_instance_id is None
+    assert node.ppid == ppid
+    assert graph.ancestors(event.process_instance_id) == []
+    assert len(graph) == 1
+
+
+def test_synthetic_ordinary_exec_is_native(tmp_path: Path) -> None:
+    record, *_ = synthetic_records()
+    event = replay(tmp_path, record)[0]
+    assert event.attributes["identity_resolution"] == "native"
+    assert "placeholder" not in event.attributes
+    assert event.parent_process_instance_id == "linux-vm-01:synthetic-parent"
+    assert event.ppid == 8400
+    assert_contract([event])
+
+
+@pytest.mark.parametrize(
+    "unresolved", ["conflicting_sensor_parent", "sensor_task_walk"]
+)
+def test_synthetic_procfs_rejects_unreliable_ancestry(
+    tmp_path: Path, unresolved: str
+) -> None:
+    record, *_ = synthetic_records()
+    body = record["process_exec"]
+    proc = body["process"]
+    proc["flags"] = "procFS rootCWD"
+    if unresolved == "conflicting_sensor_parent":
+        body["parent"]["exec_id"] = "conflicting-parent"
+    else:
+        proc["flags"] += " taskWalk"
+
+    event = replay(tmp_path, record)[0]
+    assert event.attributes["identity_resolution"] == "placeholder"
+    assert event.attributes["placeholder"] is True
+    assert event.attributes["parent_unresolved"] == unresolved
+    assert event.parent_process_instance_id is None
+    assert event.ppid is None
+    assert_contract([event])
+
+
+def test_synthetic_procfs_graph_upgrade_retains_lineage_and_evidence(
+    tmp_path: Path,
+) -> None:
+    procfs, file_record, _ = synthetic_records()
+    execution, _, _ = synthetic_records()
+    child, _, _ = synthetic_records()
+    procfs["process_exec"]["process"]["flags"] = "procFS rootCWD"
+    # A later genuine start for the same instance does not repeat the parent.
+    execution["process_exec"]["process"].pop("parent_exec_id")
+    execution["process_exec"].pop("parent")
+    child["time"] = "2026-11-17T19:40:33.050Z"
+    child["process_exec"]["process"].update(
+        exec_id="synthetic-grandchild",
+        pid=8600,
+        parent_exec_id="synthetic-child",
+        start_time=child["time"],
+    )
+    child["process_exec"]["parent"] = {"exec_id": "synthetic-child", "pid": 8500}
+    placeholder, child_start, file_event, real_start = replay(
+        tmp_path, procfs, child, file_record, execution
+    )
+    assert_contract([placeholder, child_start, file_event, real_start])
+
+    graph = ProcessGraph()
+    node = graph.apply(placeholder)
+    assert node is not None and node.placeholder
+    parent = graph.get("linux-vm-01:synthetic-parent")
+    assert parent is not None
+    assert graph.ancestors(node.process_instance_id) == [parent]
+    assert graph.descendants(parent.process_instance_id) == [node]
+    assert node.ppid == 8400
+    child_node = graph.apply(child_start)
+    assert child_node is not None
+    assert graph.apply(file_event) is node
+
+    assert graph.apply(real_start) is node
+    assert not node.placeholder
+    assert node.identity_resolution == "native"
+    assert node.start_event_id == real_start.event_id
+    assert node.ppid == 8400
+    assert graph.ancestors(child_node.process_instance_id) == [node, parent]
+    assert node.children == {child_node.process_instance_id}
+    assert graph.events_for([node.process_instance_id], ["file_access"]) == [file_event]
+
+
+def test_synthetic_procfs_requires_binary_and_timestamp(tmp_path: Path) -> None:
+    record, *_ = synthetic_records()
+    body = record["process_exec"]
+    proc = body["process"]
+    proc["flags"] = "procFS rootCWD"
     proc.pop("binary")
     assert replay(tmp_path, record) == []
     proc["binary"] = "/lab/bin/test"

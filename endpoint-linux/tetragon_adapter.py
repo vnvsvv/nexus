@@ -536,7 +536,8 @@ class TetragonAdapter:
                 return
         if exec_id is None:
             raise _Rejected("missing_process_identity")
-        if event_type == "process_start" and "procFS" in flags and not parent_id:
+        # A procFS snapshot identifies an existing process without observing its start.
+        if event_type == "process_start" and "procFS" in flags:
             resolution = "placeholder"
             attributes["placeholder"] = True
         attributes["identity_resolution"] = resolution
