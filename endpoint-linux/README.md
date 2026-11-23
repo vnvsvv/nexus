@@ -5,13 +5,15 @@ the serialized event against the canonical JSON Schema before yielding it.
 
 ## Run
 
-From the repository root, create a Python 3.11+ environment and install the
-shared contracts and test dependencies.
+From the repository root, create a Python 3.11+ environment. Install the
+shared contracts and test dependencies first, then install Endpoint Core for
+the Linux regression tests.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[tools]"
+python -m pip install -e ./endpoint-core
 ```
 
 Follow the live Tetragon export from the repository root.
