@@ -238,6 +238,26 @@ def test_an_expired_entry_is_dropped_before_a_live_one_at_the_cap(shipped, caplo
     assert not [r for r in caplog.records if "suppression" in r.getMessage()]    # dropping expired entries is not a warning
 
 
+@pytest.mark.parametrize("third_at, expired, evicted", [(59.999, 0, 1), (60.0, 1, 0), (60.001, 1, 0)])
+def test_an_entry_expiring_exactly_at_the_event_time_is_expired_not_a_live_eviction(shipped, caplog, third_at, expired, evicted):
+    """NX-WIN-002 incident window is 60 s: r1 (hit at 0) expires at exactly 60.000. With the table full, a new key at
+    t == expiry must drop r1 as EXPIRED (``expires <= t``, no warning); one millisecond earlier r1 is still live, so its
+    removal is a live eviction (counted and logged)."""
+    engine, graph = roots(shipped, 2)
+    solo(engine, graph, "r1", 0)                                                # window ends at 60.000
+    solo(engine, graph, "r2", 30)                                               # window ends at 90.000
+    before = engine.stats()
+    with caplog.at_level(logging.WARNING, logger=LOG):
+        assert solo(engine, graph, "r3", third_at) == "match"
+    stats = engine.stats()
+    assert (stats.suppression_expired - before.suppression_expired, stats.suppression_evicted - before.suppression_evicted) == (expired, evicted)
+    assert dict(engine.state_sizes())["suppression_entries"] == 2
+    assert bool([r for r in caplog.records if "suppression state is full" in r.getMessage()]) is bool(evicted)
+    assert solo(engine, graph, "r2", third_at + 1) == "suppressed"             # the genuinely live entry is never the victim
+    assert solo(engine, graph, "r3", third_at + 2) == "suppressed"
+    assert solo(engine, graph, "r1", third_at + 3) == "match"                  # r1 is gone either way
+
+
 def test_losing_a_live_entry_is_logged_once_and_then_rate_limited(shipped, caplog):
     engine, graph = roots(shipped, 2)
     with caplog.at_level(logging.WARNING, logger=LOG):

@@ -243,3 +243,57 @@ def test_replay_with_a_transient_failure_equals_replay_without_it(shipped, monke
     assert failed[-1]["matches_suppressed"] == clean[-1]["matches_suppressed"]
     assert failed[-1]["events_evaluated"] == clean[-1]["events_evaluated"]
     assert clean == _replay(shipped, False, monkeypatch)                            # deterministic
+
+
+# ------------------------------------------------------------------ counters and identity are part of "state"
+def test_the_placeholder_counter_is_unchanged_by_a_failed_evaluation_and_correct_after_the_retry(shipped, fail_rule_b):
+    """A seeded placeholder start matches both rules (A first, then B raises). Rule A's skip must not be counted by the
+    failed call: counting happens only in the commit phase, so the retry counts each skipped rule exactly once."""
+    engine, graph = setup(shipped)
+    seeded = mk("c1", 1, "par", attributes={"ti_hash_hit": True, "placeholder": True})
+    graph.apply(seeded)
+    before = snapshot(engine)
+    assert engine.stats().placeholder_starts_skipped == 0
+    fail_rule_b["on"] = True
+    with pytest.raises(BackendDefect):
+        engine.evaluate(graph, seeded)
+    assert fail_rule_b["calls"] == 1                                        # rule A was evaluated first, then rule B raised
+    assert engine.stats().placeholder_starts_skipped == 0                   # A's skip was not counted by the failed call
+    assert snapshot(engine) == before and seeded.event_id not in engine._seen
+
+    fail_rule_b["on"] = False
+    retry = engine.evaluate(graph, seeded)
+    assert retry.disposition == "evaluated" and retry.matches == () and retry.suppressed == ()
+    stats = engine.stats()
+    assert stats.placeholder_starts_skipped == 2                            # one per matching rule (A and B), not 3 (no double count)
+    assert stats.matches_emitted == 0 and stats.matches_suppressed == 0
+    assert dict(engine.state_sizes())["suppression_entries"] == 0           # a seeded start never registers a detection
+
+
+def test_the_endpoint_identity_stays_unset_after_a_failed_first_event(shipped, fail_rule_b):
+    """Only an ACCEPTED event may fix the engine's endpoint and OS. A first event that raises must not claim them."""
+    engine, graph = RuleEngine(shipped), ProcessGraph()                     # no endpoint_id: learned from the first accepted event
+    failing = mk("c1", 1, "par")                                            # a lab binary: rule B's predicates are evaluated and raise
+    graph.apply(failing)
+    fail_rule_b["on"] = True
+    with pytest.raises(BackendDefect):
+        engine.evaluate(graph, failing)
+    assert engine.endpoint_id is None and engine.arrival_count == 0
+    assert engine.stats().events_rejected_foreign == 0
+
+    fail_rule_b["on"] = False
+    other = mk("o1", 2, "opar", binary="/usr/bin/x", endpoint_id="other-vm-01", os="linux",
+               event_id="other-vm-01:evt-0000000000a1", process_instance_id="other-vm-01:o1",
+               parent_process_instance_id="other-vm-01:opar")
+    graph.apply(other)
+    result = engine.evaluate(graph, other)                                  # a different endpoint AND OS: must not be "foreign"
+    assert result.disposition == "evaluated"
+    assert engine.endpoint_id == "other-vm-01" and engine.stats().events_rejected_foreign == 0
+
+    # Control: a first event that SUCCEEDS does fix the identity, so the same kind of event is then foreign.
+    control, graph2 = RuleEngine(shipped), ProcessGraph()
+    ok = mk("c1", 1, "par")
+    graph2.apply(ok)
+    assert control.evaluate(graph2, ok).disposition == "evaluated" and control.endpoint_id == WIN
+    graph2.apply(other)
+    assert control.evaluate(graph2, other).disposition == "foreign"
