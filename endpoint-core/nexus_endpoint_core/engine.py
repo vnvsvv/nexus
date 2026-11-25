@@ -120,6 +120,20 @@ _ENDPOINT_CHARS: Final = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")     
 _WARN_EVERY: Final = 1000
 
 
+def _log_safely(level: int, message: str, *args: object) -> None:
+    """Log a diagnostic without letting a broken log sink break detection.
+
+    A handler or filter that raises ``Exception`` (full disk, bad formatter, ...) would otherwise propagate out of
+    ``evaluate``. The error is dropped on purpose: reporting it through another logger call could fail the same way, and
+    the diagnostic is only advisory (the counters in ``EngineStats`` stay the source of truth). Only ``Exception`` is
+    caught, so ``KeyboardInterrupt``, ``SystemExit`` and ``MemoryError`` still propagate.
+    """
+    try:
+        log.log(level, message, *args)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _to_ms(moment: datetime) -> int:
     """Exact integer milliseconds since the epoch (no float rounding)."""
     return (moment - _EPOCH) // _MS
@@ -540,7 +554,7 @@ class RuleEngine:
     def _skip(self, disposition: Disposition, counter: str, why: str, warn: bool = True) -> EngineResult:
         self._counters[counter] += 1
         if warn and (self._counters[counter] == 1 or self._counters[counter] % _WARN_EVERY == 0):
-            log.warning("event skipped (%s, %d so far): %s", disposition, self._counters[counter], why)
+            _log_safely(logging.WARNING, "event skipped (%s, %d so far): %s", disposition, self._counters[counter], why)
         return EngineResult(disposition=disposition)
 
     def evaluate(self, graph: ProcessGraph, event: HostEvent) -> EngineResult:
@@ -553,7 +567,9 @@ class RuleEngine:
         ``EngineMatch`` or, inside an active suppression window, a ``SuppressedMatch``. Sequence and threshold rules
         are not evaluated yet. An exception from a regex backend propagates (a defect is not hidden). Evaluation is
         prepared first and committed afterwards, so a failure leaves suppression state, detection counters and the seen
-        record untouched (only ``events_received`` counts the call) and the same event can be retried.
+        record untouched (only ``events_received`` counts the call) and the same event can be retried. Diagnostics are
+        logged only after the state is recorded, and a logging handler or filter that raises ``Exception`` is ignored
+        (see ``_log_safely``); this does not cover ``KeyboardInterrupt``, ``MemoryError`` or process termination.
         """
         self._counters["events_received"] += 1
         if not event.process_instance_id.startswith(f"{event.endpoint_id}:"):
@@ -580,7 +596,7 @@ class RuleEngine:
         if event.event_id in self._seen:
             return self._skip("duplicate", "events_ignored_duplicate", "", warn=False)
 
-        matches, suppressed = self._evaluate_singles(graph, event)
+        matches, suppressed, evictions = self._evaluate_singles(graph, event)
 
         if self._endpoint_id is None:                                   # only an accepted event may fix the identity
             self._endpoint_id = event.endpoint_id
@@ -590,15 +606,20 @@ class RuleEngine:
             self._seen.popitem(last=False)
             self._counters["seen_evicted"] += 1
         self._counters["events_evaluated"] += 1
+        for evicted_so_far in evictions:                                # state is final: only now may logging run
+            _log_safely(logging.WARNING, "suppression state is full (%d entries): a live entry was evicted (%d so far); "
+                        "repeats of that detection may fire again", self.limits.max_suppression_entries, evicted_so_far)
         return EngineResult(tuple(matches), tuple(suppressed))
 
     # -- single rules ------------------------------------------------------------------------------
-    def _evaluate_singles(self, graph: ProcessGraph, event: HostEvent) -> tuple[list[EngineMatch], list[SuppressedMatch]]:
+    def _evaluate_singles(self, graph: ProcessGraph, event: HostEvent) -> tuple[list[EngineMatch], list[SuppressedMatch], list[int]]:
+        """Returns the matches, the suppressed repeats, and the eviction counts whose warning the caller should log."""
         matches: list[EngineMatch] = []
         suppressed: list[SuppressedMatch] = []
+        evictions: list[int] = []
         singles = self._singles.get((event.os, event.event_type), ())
         if not singles:
-            return matches, suppressed
+            return matches, suppressed, evictions
         seeded = event.event_type == "process_start" and _is_seeded_placeholder_start(event)
         node = graph.get(event.process_instance_id)                     # present: evaluate() checked
         moment = parse_utc(event.timestamp_utc)
@@ -631,26 +652,34 @@ class RuleEngine:
                                      trigger_event_id=event.event_id, bindings=bindings, events=bound)
             prepared.append(((rule.id, root.process_id), self._window_ms[rule.id], fresh, repeat))
 
-        # Phase 2 - commit. Only dictionary and counter bookkeeping on values prepared above; no predicate, graph or
-        # object construction runs here.
+        # Phase 2 - commit. Only dictionary and counter bookkeeping on values prepared above; no predicate, graph,
+        # object construction or logging runs here (warnings are returned and logged after the event is recorded).
         self._counters["placeholder_starts_skipped"] += skipped_placeholders
         for key, window_ms, fresh, repeat in prepared:
-            if self._register_hit(key, t_ms, window_ms):
+            repeat_hit, evicted_so_far = self._register_hit(key, t_ms, window_ms)
+            if evicted_so_far is not None:
+                evictions.append(evicted_so_far)
+            if repeat_hit:
                 self._counters["matches_suppressed"] += 1
                 suppressed.append(repeat)
             else:
                 self._counters["matches_emitted"] += 1
                 matches.append(fresh)
-        return matches, suppressed
+        return matches, suppressed, evictions
 
-    def _register_hit(self, key: tuple[str, str], t_ms: int, window_ms: int) -> bool:
-        """Record a detection for ``key`` at event time ``t_ms``. True if it repeats an active entry (suppressed)."""
+    def _register_hit(self, key: tuple[str, str], t_ms: int, window_ms: int) -> tuple[bool, int | None]:
+        """Record a detection for ``key`` at event time ``t_ms``; never logs.
+
+        Returns ``(repeat, evicted_so_far)``: ``repeat`` is True if it repeats an active entry (suppressed);
+        ``evicted_so_far`` is the live-eviction count when this call should be reported (first, then every
+        ``_WARN_EVERY``-th), else None.
+        """
         entry = self._suppression.get(key)
         if entry is not None and t_ms < entry[1]:                        # active: the window is half-open
             last = max(entry[0], t_ms)                                    # a late event never moves the window backwards
             self._suppression[key] = (last, last + window_ms)
             self._suppression.move_to_end(key)
-            return True
+            return True, None
         if entry is not None:                                             # expired: this detection starts a new window
             self._counters["suppression_expired"] += 1
             del self._suppression[key]
@@ -664,7 +693,5 @@ class RuleEngine:
                 self._suppression.popitem(last=False)
                 self._counters["suppression_evicted"] += 1
                 if self._counters["suppression_evicted"] == 1 or self._counters["suppression_evicted"] % _WARN_EVERY == 0:
-                    log.warning("suppression state is full (%d entries): a live entry was evicted (%d so far); "
-                                "repeats of that detection may fire again", self.limits.max_suppression_entries,
-                                self._counters["suppression_evicted"])
-        return False
+                    return False, self._counters["suppression_evicted"]
+        return False, None

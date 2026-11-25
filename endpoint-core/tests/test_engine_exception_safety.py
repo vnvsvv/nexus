@@ -297,3 +297,98 @@ def test_the_endpoint_identity_stays_unset_after_a_failed_first_event(shipped, f
     assert control.evaluate(graph2, ok).disposition == "evaluated" and control.endpoint_id == WIN
     graph2.apply(other)
     assert control.evaluate(graph2, other).disposition == "foreign"
+
+
+# ------------------------------------------------------------------ a failing log sink must not break evaluation
+LOG = "nexus_endpoint_core.engine"
+
+
+class _RaisingHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        raise OSError("log sink is broken")
+
+
+def _raise_in_filter(record: logging.LogRecord) -> bool:
+    raise OSError("log filter is broken")
+
+
+@pytest.fixture(params=["handler", "filter"])
+def broken_sink(request):
+    """A handler (or a filter) on the engine's logger that raises for every record, as a full disk or a bad formatter would."""
+    logger = logging.getLogger(LOG)
+    sink = _RaisingHandler() if request.param == "handler" else _raise_in_filter
+    (logger.addHandler if request.param == "handler" else logger.addFilter)(sink)
+    yield request.param
+    (logger.removeHandler if request.param == "handler" else logger.removeFilter)(sink)
+
+
+def _two_rule_eviction(shipped: RuleSet):
+    """Cap 1: one event matches rules A and B, so B's new entry evicts A's live one, which is the logged event."""
+    engine, graph = setup(shipped, limits=EngineLimits(max_suppression_entries=1))
+    event = both("c1", 1)
+    graph.apply(event)
+    return engine, graph, event
+
+
+def _reference_state(shipped: RuleSet):
+    engine, graph, event = _two_rule_eviction(shipped)
+    result = engine.evaluate(graph, event)
+    return snapshot(engine), [m.rule.id for m in result.matches]
+
+
+def test_a_failing_log_sink_does_not_break_a_two_rule_eviction(shipped, broken_sink):
+    expected_state, expected_rules = _reference_state(shipped)
+    engine, graph, event = _two_rule_eviction(shipped)
+    result = engine.evaluate(graph, event)                                  # must not raise
+    assert result.disposition == "evaluated" and result.suppressed == ()
+    assert [m.rule.id for m in result.matches] == expected_rules == [RULE_A, RULE_B]
+    stats = engine.stats()
+    assert (stats.matches_emitted, stats.matches_suppressed, stats.suppression_evicted) == (2, 0, 1)
+    assert dict(engine.state_sizes())["suppression_entries"] == 1
+    assert event.event_id in engine._seen and stats.events_evaluated == 2    # the event was fully accepted, nothing to retry
+    got = snapshot(engine)                                                  # identical to a run with a healthy sink (ids differ per run)
+    assert (list(got[0].values()), got[2], got[3]) == (list(expected_state[0].values()), expected_state[2], expected_state[3])
+    assert [k for k, _ in got[0].items()] == [k for k, _ in expected_state[0].items()]
+
+
+def test_a_failing_log_sink_does_not_turn_a_redelivery_into_a_wrong_result(shipped, broken_sink):
+    engine, graph, event = _two_rule_eviction(shipped)
+    engine.evaluate(graph, event)
+    assert engine.evaluate(graph, event).disposition == "duplicate"         # accepted once: no second match, no downgrade
+    assert engine.stats().matches_emitted == 2 and engine.stats().matches_suppressed == 0
+
+
+def test_a_failing_log_sink_does_not_break_skip_diagnostics(shipped, broken_sink):
+    engine, graph = setup(shipped)
+    stranger = mk("x1", 2, "xpar", endpoint_id="other-vm-01", process_instance_id="other-vm-01:x1",
+                  parent_process_instance_id="other-vm-01:xpar", event_id="other-vm-01:evt-0000000000b1")
+    result = engine.evaluate(graph, stranger)                               # the first skip is logged, and the sink raises
+    assert result.disposition == "foreign" and engine.stats().events_rejected_foreign == 1
+
+
+def test_the_eviction_warning_is_emitted_after_the_event_is_fully_recorded(shipped):
+    engine, graph, event = _two_rule_eviction(shipped)
+    seen_at_emit: list[tuple[bool, int, int]] = []
+
+    class Spy(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            seen_at_emit.append((event.event_id in engine._seen, engine.stats().events_evaluated, engine.stats().matches_emitted))
+
+    logger, spy = logging.getLogger(LOG), Spy(level=logging.WARNING)
+    logger.addHandler(spy)
+    try:
+        engine.evaluate(graph, event)
+    finally:
+        logger.removeHandler(spy)
+    assert seen_at_emit == [(True, 2, 2)]                                   # logged once, after the commit and the bookkeeping
+
+
+def test_a_failing_sink_does_not_hide_a_real_defect_and_the_failed_call_still_leaves_no_trace(shipped, fail_rule_b, broken_sink):
+    engine, graph = setup(shipped)
+    event = both("c1", 1)
+    graph.apply(event)
+    before = snapshot(engine)
+    fail_rule_b["on"] = True
+    with pytest.raises(BackendDefect):                                      # the defect propagates, not the sink's error
+        engine.evaluate(graph, event)
+    assert snapshot(engine) == before and event.event_id not in engine._seen
