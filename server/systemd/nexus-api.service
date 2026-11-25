@@ -1,0 +1,2 @@
+# nexus-api: FastAPI on HTTPS 8443. Roadmap: R9. Not written yet.
+# Least privilege: no capabilities (CapabilityBoundingSet= empty, NoNewPrivileges=yes).

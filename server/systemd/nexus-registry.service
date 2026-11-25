@@ -1,0 +1,2 @@
+# nexus-registry: conntrack -E reader. Roadmap: R9. Not written yet.
+# Least privilege: only CAP_NET_ADMIN (needed to read conntrack events).
