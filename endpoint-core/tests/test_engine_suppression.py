@@ -282,6 +282,153 @@ def test_state_bounds_report_the_suppression_limit(shipped):
     assert RuleEngine(shipped, limits=EngineLimits(max_suppression_entries=7)).state_bounds()["suppression_entries"] == 7
 
 
+# ------------------------------------------------------------------ expiry is lazy: no entry is removed because ANOTHER key's event is later
+# An entry that looks expired to the newest event can still be needed by an event that arrives late. These tests fail if
+# entries are swept by the time of whatever event is being processed.
+def suppression_counters(engine: RuleEngine) -> tuple[int, int, int, int]:
+    """(emitted, suppressed, expired, evicted)"""
+    s = engine.stats()
+    return s.matches_emitted, s.matches_suppressed, s.suppression_expired, s.suppression_evicted
+
+
+@pytest.mark.parametrize("other", ["other_root", "other_rule"])
+@pytest.mark.parametrize("late_at, expected, counters", [(50.0, "suppressed", (2, 1, 0, 0)), (59.999, "suppressed", (2, 1, 0, 0)),
+                                                         (60.0, "match", (3, 0, 1, 0))])
+def test_a_late_repeat_is_still_suppressed_after_a_later_event_of_another_key(shipped, other, late_at, expected, counters):
+    """A fires at 0 (NX-WIN-002, window ends at 60). Another key fires at 70. A's repeat arrives last but is stamped inside
+    A's window: it is judged by its own time. The half-open end (60.000) is not moved by the event at 70 either."""
+    engine, graph = setup(shipped)
+    feed(engine, graph, mk("par2", binary=CMD))
+    assert outcome(feed(engine, graph, mk("a1", 0, "par"))) == "match"
+    if other == "other_root":                                                  # the same rule on an unrelated root
+        later = feed(engine, graph, mk("b1", 70, "par2"))
+    else:                                                                      # another rule (NX-ANY-001) on the same root
+        later = feed(engine, graph, mk("b1", 70, "par", binary=CMD, attributes={"ti_hash_hit": True}))
+    assert outcome(later) == "match"
+    assert later.matches[0].rule.id == ("NX-WIN-002" if other == "other_root" else "NX-ANY-001")
+    assert suppression_counters(engine) == (2, 0, 0, 0) and dict(engine.state_sizes())["suppression_entries"] == 2
+
+    late = feed(engine, graph, mk("a2", late_at, "par"))                       # a distinct event and process, same (rule, root)
+    assert late.disposition == "evaluated" and outcome(late) == expected
+    (hit,) = late.matches + late.suppressed
+    assert (hit.rule.id, hit.root_process_instance_id) == ("NX-WIN-002", f"{WIN}:par")
+    assert suppression_counters(engine) == counters and dict(engine.state_sizes())["suppression_entries"] == 2
+
+
+@pytest.mark.parametrize("live", [True, False], ids=["live_clock", "replay_without_clock"])
+def test_a_future_dated_event_does_not_erase_entries_still_needed_by_in_time_events(shipped, live):
+    """Live mode accepts events up to 300 s ahead of the clock; replay trusts any timestamp. One such event is later than
+    every window here (60 s), yet the in-time repeats that follow must all still be suppressed."""
+    clock_at = 20.0
+    engine, graph = RuleEngine(shipped, endpoint_id=WIN, clock=(lambda: NOW + timedelta(seconds=clock_at)) if live else None), ProcessGraph()
+    names = [f"r{i}" for i in range(12)]
+    assert [solo(engine, graph, name, i * 0.5) for i, name in enumerate(names)] == ["match"] * 12     # hits at 0 .. 5.5
+    future_at = clock_at + 300 if live else 10 * 86_400.0
+    if live:                                                                    # one millisecond beyond the allowed skew: rejected
+        rejected = feed(engine, graph, mk("too-far", future_at + 0.001))
+        assert rejected.disposition == "future" and outcome(rejected) == "none"
+    ahead = feed(engine, graph, mk("ahead", future_at))
+    assert ahead.disposition == "evaluated" and outcome(ahead) == "match"
+    assert suppression_counters(engine) == (13, 0, 0, 0) and dict(engine.state_sizes())["suppression_entries"] == 13
+
+    assert [solo(engine, graph, name, 10 + i * 0.5) for i, name in enumerate(names)] == ["suppressed"] * 12
+    assert suppression_counters(engine) == (13, 12, 0, 0) and dict(engine.state_sizes())["suppression_entries"] == 13
+    assert engine.stats().events_ignored_future == (1 if live else 0)
+
+
+@pytest.mark.parametrize("late_at", [109.999, 100.0, 0.0], ids=["just_over_20s_earlier", "at_first_hit", "before_first_hit"])
+@pytest.mark.parametrize("probe_at, expected, counters", [(189.999, "suppressed", (1, 3, 0, 0)), (190.0, "match", (2, 2, 1, 0))])
+def test_a_repeat_far_earlier_than_the_last_hit_is_suppressed_and_does_not_move_the_expiry(shipped, late_at, probe_at, expected, counters):
+    """NX-WIN-002 (60 s): A fires at 100 and is refreshed at 130, so its window ends at 190. A distinct repeat stamped more
+    than 20 s before that last hit (even before the first hit) is still a repeat: there is no lower time limit. It leaves
+    the stored window exactly as it was."""
+    engine, graph = setup(shipped)
+    assert outcome(feed(engine, graph, mk("a1", 100, "par"))) == "match"
+    assert outcome(feed(engine, graph, mk("a2", 130, "par"))) == "suppressed"
+    stored = dict(engine._suppression)
+    assert list(stored) == [("NX-WIN-002", f"{WIN}:par")]
+
+    late_event = mk("late", late_at, "par")
+    late = feed(engine, graph, late_event)
+    assert late.disposition == "evaluated" and outcome(late) == "suppressed"
+    (repeat,) = late.suppressed
+    assert repeat.rule.id == "NX-WIN-002" and repeat.root_process_instance_id == f"{WIN}:par"
+    assert dict(repeat.bindings) == {"bin": late_event.event_id}
+    assert dict(engine._suppression) == stored                                  # neither the last hit nor the expiry moved back
+    assert suppression_counters(engine) == (1, 2, 0, 0) and dict(engine.state_sizes())["suppression_entries"] == 1
+
+    assert outcome(feed(engine, graph, mk("probe", probe_at, "par"))) == expected    # the window still ends at exactly 190
+    assert suppression_counters(engine) == counters and dict(engine.state_sizes())["suppression_entries"] == 1
+
+
+@pytest.mark.parametrize("refresh", ["in_order", "late"])
+@pytest.mark.parametrize("last_at, expected, counters", [(109.999, "suppressed", (13, 2, 0, 0)), (110.0, "match", (14, 1, 1, 0))])
+def test_a_refreshed_entry_outlives_its_first_window_while_other_keys_arrive(shipped, refresh, last_at, expected, counters):
+    """A fires at 0 (first window ends at 60) and is refreshed at 50 (now ends at 110), either before or after twelve other
+    keys fire at 70 .. 81. The refreshed end is what counts, to the millisecond."""
+    engine, graph = setup(shipped)
+    assert outcome(feed(engine, graph, mk("a1", 0, "par"))) == "match"
+    if refresh == "in_order":
+        assert outcome(feed(engine, graph, mk("a2", 50, "par"))) == "suppressed"
+    assert [solo(engine, graph, f"r{i}", 70 + i) for i in range(12)] == ["match"] * 12
+    if refresh == "late":
+        assert outcome(feed(engine, graph, mk("a2", 50, "par"))) == "suppressed"
+    assert suppression_counters(engine) == (13, 1, 0, 0) and dict(engine.state_sizes())["suppression_entries"] == 13
+
+    assert outcome(feed(engine, graph, mk("a3", last_at, "par"))) == expected
+    assert suppression_counters(engine) == counters and dict(engine.state_sizes())["suppression_entries"] == 13
+
+
+def test_state_sizes_reports_retained_entries_including_expired_ones(shipped):
+    engine, graph = RuleEngine(shipped, endpoint_id=WIN), ProcessGraph()         # default limits: no capacity pressure
+    for i in range(5):
+        assert solo(engine, graph, f"r{i}", i) == "match"                        # windows end at 60 .. 64
+    assert solo(engine, graph, "new", 1000) == "match"                           # a later processed event: r0 .. r4 have expired
+    assert dict(engine.state_sizes())["suppression_entries"] == 6                # retained, not "currently live" (that would be 1)
+    assert solo(engine, graph, "again", 5000) == "match"
+    assert outcome(feed(engine, graph, mk("benign", 9000, binary=CMD))) == "none"
+    assert dict(engine.state_sizes())["suppression_entries"] == 7 and suppression_counters(engine) == (7, 0, 0, 0)
+
+    assert solo(engine, graph, "r0", 9001) == "match"                            # retained does not mean suppressing: r0's window is over
+    assert dict(engine.state_sizes())["suppression_entries"] == 7                # its entry is replaced, and only now counted as expired
+    assert suppression_counters(engine) == (8, 0, 1, 0)
+    assert engine.state_bounds()["suppression_entries"] == EngineLimits().max_suppression_entries
+
+
+@pytest.mark.parametrize("late_at, expired, evicted", [(50.0, 0, 1), (59.999, 0, 1), (60.0, 1, 0)])
+def test_at_the_cap_a_late_event_judges_expiry_by_its_own_time(shipped, caplog, late_at, expired, evicted):
+    """Table full: r1 (ends at 60) and r2 (hit at 100). A new key then arrives late. r1 is over by the newest time seen (100),
+    but still live at the late event's own time, so its removal is counted as a live eviction and logged; from 60.000 on
+    it is counted as expired and is not logged."""
+    engine, graph = roots(shipped, 2)
+    assert solo(engine, graph, "r1", 0) == "match"
+    with caplog.at_level(logging.WARNING, logger=LOG):
+        assert solo(engine, graph, "r2", 100) == "match"                         # fits: below the cap nothing is removed
+        assert suppression_counters(engine) == (2, 0, 0, 0) and not caplog.records
+        assert solo(engine, graph, "r3", late_at) == "match"
+    assert suppression_counters(engine) == (3, 0, expired, evicted) and dict(engine.state_sizes())["suppression_entries"] == 2
+    assert len([r for r in caplog.records if "suppression state is full" in r.getMessage()]) == evicted
+
+    assert solo(engine, graph, "r2", 101) == "suppressed"                        # the newer entry survived ...
+    assert solo(engine, graph, "r3", late_at + 59.999) == "suppressed"           # ... and the late key owns a full window from its own time
+    assert solo(engine, graph, "r1", 55) == "match"                              # r1 was the one removed, so a late repeat fires again
+    assert suppression_counters(engine) == (4, 2, expired, evicted + 1)          # r1's return removes a live entry
+
+
+def test_at_the_cap_a_future_dated_event_counts_the_removed_entry_as_expired(shipped, caplog):
+    """The mirror image: judged by a future-dated event, entries that in-time events still need look expired. Exactly one is
+    removed (only what the cap requires), it is counted as ``suppression_expired``, and nothing is logged."""
+    engine, graph = roots(shipped, 3, clock=lambda: NOW + timedelta(seconds=20))
+    for i in (1, 2, 3):
+        assert solo(engine, graph, f"r{i}", i) == "match"
+    with caplog.at_level(logging.WARNING, logger=LOG):
+        assert solo(engine, graph, "ahead", 320) == "match"                      # the inclusive skew limit: accepted
+    assert suppression_counters(engine) == (4, 0, 1, 0) and not caplog.records
+    assert dict(engine.state_sizes())["suppression_entries"] == 3
+    assert solo(engine, graph, "r2", 10) == "suppressed" and solo(engine, graph, "r3", 11) == "suppressed"
+    assert solo(engine, graph, "r1", 12) == "match"                              # r1 (least recently updated) was removed
+
+
 # ------------------------------------------------------------------ duplicates and the deduplication horizon
 def test_a_duplicate_event_id_produces_neither_a_match_nor_a_suppressed_match(shipped):
     engine, graph = setup(shipped)
