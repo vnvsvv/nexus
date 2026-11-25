@@ -392,3 +392,53 @@ def test_a_failing_sink_does_not_hide_a_real_defect_and_the_failed_call_still_le
     with pytest.raises(BackendDefect):                                      # the defect propagates, not the sink's error
         engine.evaluate(graph, event)
     assert snapshot(engine) == before and event.event_id not in engine._seen
+
+
+# ------------------------------------------------------------------ fatal conditions are never swallowed by the log guard
+class _FatalHandler(logging.Handler):
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self.exc = exc
+
+    def emit(self, record: logging.LogRecord) -> None:
+        raise self.exc
+
+
+@pytest.mark.parametrize("exc", [MemoryError("out of memory"), KeyboardInterrupt(), SystemExit(3)], ids=["MemoryError", "KeyboardInterrupt", "SystemExit"])
+def test_a_fatal_exception_from_a_log_handler_is_not_suppressed(shipped, exc):
+    engine, graph, event = _two_rule_eviction(shipped)
+    logger, handler = logging.getLogger(LOG), _FatalHandler(exc)
+    logger.addHandler(handler)
+    try:
+        with pytest.raises(type(exc)):
+            engine.evaluate(graph, event)                                   # propagates; no atomicity is claimed for this case
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_a_memory_error_from_a_log_filter_is_not_suppressed(shipped):
+    engine, graph, event = _two_rule_eviction(shipped)
+    logger = logging.getLogger(LOG)
+
+    def boom(record: logging.LogRecord) -> bool:
+        raise MemoryError("out of memory")
+
+    logger.addFilter(boom)
+    try:
+        with pytest.raises(MemoryError):
+            engine.evaluate(graph, event)
+    finally:
+        logger.removeFilter(boom)
+
+
+def test_a_memory_error_from_a_skip_diagnostic_is_not_suppressed(shipped):
+    engine, graph = setup(shipped)
+    stranger = mk("x1", 2, "xpar", endpoint_id="other-vm-01", process_instance_id="other-vm-01:x1",
+                  parent_process_instance_id="other-vm-01:xpar", event_id="other-vm-01:evt-0000000000b2")
+    logger, handler = logging.getLogger(LOG), _FatalHandler(MemoryError("out of memory"))
+    logger.addHandler(handler)
+    try:
+        with pytest.raises(MemoryError):
+            engine.evaluate(graph, stranger)
+    finally:
+        logger.removeHandler(handler)

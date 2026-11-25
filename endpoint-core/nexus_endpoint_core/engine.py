@@ -125,11 +125,15 @@ def _log_safely(level: int, message: str, *args: object) -> None:
 
     A handler or filter that raises ``Exception`` (full disk, bad formatter, ...) would otherwise propagate out of
     ``evaluate``. The error is dropped on purpose: reporting it through another logger call could fail the same way, and
-    the diagnostic is only advisory (the counters in ``EngineStats`` stay the source of truth). Only ``Exception`` is
-    caught, so ``KeyboardInterrupt``, ``SystemExit`` and ``MemoryError`` still propagate.
+    the diagnostic is only advisory (the counters in ``EngineStats`` stay the source of truth). Ordinary exceptions are
+    dropped. ``MemoryError`` is a subclass of ``Exception``, so it is re-raised explicitly; ``KeyboardInterrupt`` and
+    ``SystemExit`` derive from ``BaseException`` and are never caught. None of these is suppressed, and no atomicity is
+    claimed when one of them interrupts evaluation.
     """
     try:
         log.log(level, message, *args)
+    except MemoryError:
+        raise
     except Exception:  # noqa: BLE001
         pass
 
@@ -569,7 +573,8 @@ class RuleEngine:
         prepared first and committed afterwards, so a failure leaves suppression state, detection counters and the seen
         record untouched (only ``events_received`` counts the call) and the same event can be retried. Diagnostics are
         logged only after the state is recorded, and a logging handler or filter that raises ``Exception`` is ignored
-        (see ``_log_safely``); this does not cover ``KeyboardInterrupt``, ``MemoryError`` or process termination.
+        (see ``_log_safely``). ``MemoryError``, ``KeyboardInterrupt`` and ``SystemExit`` are not suppressed and no atomicity
+        is claimed for them or for process termination.
         """
         self._counters["events_received"] += 1
         if not event.process_instance_id.startswith(f"{event.endpoint_id}:"):
