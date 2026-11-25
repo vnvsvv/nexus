@@ -1,0 +1,1 @@
+# Pinned (==) versions are added step by step, starting with R2 (sqlalchemy, psycopg[binary]).
