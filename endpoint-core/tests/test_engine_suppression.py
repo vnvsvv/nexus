@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import itertools
 import logging
+import random
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -461,6 +463,208 @@ def test_a_forgotten_event_is_only_suppressed_while_its_suppression_entry_lives(
     feed(engine, graph, mk("b", 1, binary=CMD, attributes={"ti_hash_hit": True}))      # pushes `first` out of the horizon
     replay = engine.evaluate(graph, first)
     assert replay.disposition == "evaluated" and outcome(replay) == "suppressed"      # the entry for (rule, root a) is still there
+
+
+# ------------------------------------------------------------------ every ACCEPTED event is tracked, not only a matching one
+def test_an_evaluated_event_that_matches_nothing_is_deduplicated_unlike_one_no_rule_listens_to(shipped):
+    engine, graph = setup(shipped)                                             # the parent is the first tracked event
+    benign = mk("b1", 1, "par", binary=CMD)                                    # two single rules listen; neither matches
+    first = feed(engine, graph, benign)
+    assert first.disposition == "evaluated" and first.matches == () and first.suppressed == ()
+    assert benign.event_id in engine._seen
+    again = feed(engine, graph, benign)
+    assert again.disposition == "duplicate" and again.matches == () and again.suppressed == ()
+
+    unheard = mk("b1", 2, event_type="dns_query", dns={"query": "a.test"})     # no enabled rule listens to dns_query
+    assert [feed(engine, graph, unheard).disposition for _ in range(2)] == ["no_rules", "no_rules"]    # never a "duplicate"
+    assert unheard.event_id not in engine._seen
+
+    stats = engine.stats()
+    assert (stats.events_received, stats.events_evaluated, stats.events_ignored_duplicate, stats.events_ignored_no_rules) == (5, 2, 1, 2)
+    assert engine.arrival_count == 2 and dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0}
+    assert suppression_counters(engine) == (0, 0, 0, 0)
+
+
+# A3a does not evaluate sequence or threshold rules. Their events are still ACCEPTED (a rule is indexed for the event type)
+# and tracked. A3b must keep tracking them, including an anchor whose search finds nothing.
+@pytest.mark.parametrize("extra", [
+    {"event_type": "file_access", "file": {"path": "C:\\Lab\\staging\\report.zip", "operation": "write"}},
+    {"event_type": "network_connect", "network": {"protocol": "TCP", "src_ip": "192.168.30.10", "src_port": 50000,
+                                                  "dst_ip": "192.168.20.10", "dst_port": 8443, "direction": "outbound"}},
+], ids=["sequence_only_file_access", "sequence_and_threshold_network_connect"])
+def test_an_event_only_sequence_or_threshold_rules_listen_to_is_tracked_but_detects_nothing(shipped, extra):
+    engine, graph = setup(shipped)
+    event = mk("c1", 1, "par", binary=CMD, **extra)
+    assert {entry.kind for entry in engine.index_for("windows", event.event_type)} <= {"sequence", "threshold"}
+    first = feed(engine, graph, event)
+    assert first.disposition == "evaluated" and first.matches == () and first.suppressed == ()
+    assert event.event_id in engine._seen
+    assert feed(engine, graph, event).disposition == "duplicate"
+    assert engine.stats().events_ignored_no_rules == 0 and engine.stats().events_ignored_duplicate == 1
+    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0} and suppression_counters(engine) == (0, 0, 0, 0)
+
+
+# ------------------------------------------------------------------ first arrival wins
+def test_the_first_arrival_of_an_event_id_wins_over_later_content_that_would_match(shipped):
+    engine, graph = setup(shipped)
+    shared = f"{WIN}:evt-f1f1f1f1f1f1"
+    benign = mk("c1", 1, "par", binary=CMD, event_id=shared)
+    assert outcome(feed(engine, graph, benign)) == "none"
+    changed = mk("c1", 2, "par", event_id=shared, attributes={"ti_hash_hit": True})       # same id and process, now suspicious
+    second = feed(engine, graph, changed)
+    assert second.disposition == "duplicate" and second.matches == () and second.suppressed == ()
+    assert graph.get(f"{WIN}:c1").binary == CMD                                # the graph kept the first content too
+    assert suppression_counters(engine) == (0, 0, 0, 0) and engine.stats().events_ignored_duplicate == 1
+    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0}
+
+    control, control_graph = setup(shipped)                                    # the later content does satisfy two rules by itself
+    alone = feed(control, control_graph, mk("c1", 2, "par", attributes={"ti_hash_hit": True}))
+    assert [m.rule.id for m in alone.matches] == ["NX-ANY-001", "NX-WIN-002"]
+
+
+def test_a_reused_event_id_naming_another_process_creates_no_node_and_no_match(shipped):
+    """The graph ignores an event id it already holds, so the other process never exists and the engine reports
+    ``not_in_graph`` (checked before the duplicate test). Either way the later content detects nothing."""
+    engine, graph = setup(shipped)
+    shared = f"{WIN}:evt-f2f2f2f2f2f2"
+    feed(engine, graph, mk("c1", 1, "par", binary=CMD, event_id=shared))
+    other = feed(engine, graph, mk("c2", 2, "par", event_id=shared))
+    assert other.disposition == "not_in_graph" and other.matches == () and other.suppressed == ()
+    assert graph.get(f"{WIN}:c2") is None and suppression_counters(engine) == (0, 0, 0, 0)
+    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0}
+
+
+# ------------------------------------------------------------------ the placeholder counter counts (rule, event) pairs
+def test_a_redelivered_seeded_placeholder_start_is_not_counted_again(shipped):
+    engine, graph = setup(shipped)
+    attributes = {"placeholder": True, "ti_hash_hit": True}                    # satisfies NX-ANY-001 and NX-WIN-002
+    seeded = mk("seed", 1, "par", attributes=attributes)
+    assert feed(engine, graph, seeded).disposition == "evaluated" and engine.stats().placeholder_starts_skipped == 2
+    for _ in range(3):
+        again = feed(engine, graph, seeded)
+        assert again.disposition == "duplicate" and again.matches == () and again.suppressed == ()
+        assert engine.stats().placeholder_starts_skipped == 2
+    assert engine.stats().events_ignored_duplicate == 3 and suppression_counters(engine) == (0, 0, 0, 0)
+    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0}
+
+    another = mk("seed", 2, "par", attributes=attributes)                      # a second event for the SAME placeholder process
+    assert feed(engine, graph, another).disposition == "evaluated"
+    assert engine.stats().placeholder_starts_skipped == 4                      # per (rule, event id), not per placeholder process
+
+
+# ------------------------------------------------------------------ redelivery inside the horizon changes nothing
+def duplicate_stream() -> list[HostEvent]:
+    seeded = {"placeholder": True, "ti_hash_hit": True}
+    return [mk("par", 0, binary=CMD),
+            mk("c1", 1, "par"),                                                # match (NX-WIN-002)
+            mk("c2", 2, "par"),                                                # suppressed
+            mk("b1", 3, "par", binary=CMD),                                    # evaluated, matches nothing
+            mk("seed", 4, "par", attributes=seeded),                           # two (rule, event) pairs skipped
+            mk("c3", 5, "par", attributes={"ti_hash_hit": True}),              # NX-ANY-001 match, NX-WIN-002 suppressed
+            mk("c4", 500, "par"),                                              # the window is over: a new match
+            mk("b2", 501, "par", binary=CMD)]
+
+
+def with_redeliveries(stream: list[HostEvent], seed: int) -> list[tuple[bool, HostEvent]]:
+    """Every event again one to three times: at seeded positions after its first delivery, and once at the very end
+    (after every suppression window it opened has expired)."""
+    rng = random.Random(seed)
+    out: list[tuple[bool, HostEvent]] = [(False, event) for event in stream]
+    for event in stream:
+        for _ in range(rng.randint(0, 2)):
+            first_at = next(i for i, (_, e) in enumerate(out) if e is event)
+            out.insert(rng.randint(first_at + 1, len(out)), (True, event))
+    return out + [(True, event) for event in stream]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+def test_redelivery_inside_the_horizon_changes_no_detection_and_no_state(shipped, seed):
+    stream = duplicate_stream()
+
+    def run(deliveries: list[tuple[bool, HostEvent]]) -> tuple[list[Any], list[EngineResult], dict[str, int], tuple[Any, ...]]:
+        engine, graph = RuleEngine(shipped, endpoint_id=WIN), ProcessGraph()
+        firsts, repeats = [], []
+        for is_repeat, event in deliveries:
+            result = feed(engine, graph, event)
+            if is_repeat:
+                repeats.append(result)
+            else:
+                firsts.append((result.disposition, [m.to_contract().model_dump() for m in result.matches],
+                               [m.root_process_instance_id for m in result.matches],
+                               [(s.rule.id, s.root_process_instance_id, dict(s.bindings), s.matched_at) for s in result.suppressed]))
+        state = (list(engine._suppression.items()), list(engine._seen), engine.endpoint_id, engine.arrival_count,
+                 dict(engine.state_sizes()), sorted(graph.nodes))
+        return firsts, repeats, asdict(engine.stats()), state
+
+    clean_firsts, none, clean_stats, clean_state = run([(False, event) for event in stream])
+    deliveries = with_redeliveries(stream, seed)
+    firsts, repeats, stats, state = run(deliveries)
+    redelivered = len(deliveries) - len(stream)
+
+    assert none == [] and redelivered >= len(stream)
+    assert (clean_stats["matches_emitted"], clean_stats["matches_suppressed"], clean_stats["suppression_expired"],
+            clean_stats["placeholder_starts_skipped"]) == (3, 2, 1, 2)         # the stream really exercises all of these
+    assert firsts == clean_firsts and state == clean_state
+    assert len(repeats) == redelivered
+    assert all(r.disposition == "duplicate" and r.matches == () and r.suppressed == () for r in repeats)
+    expected = dict(clean_stats, events_received=clean_stats["events_received"] + redelivered,
+                    events_ignored_duplicate=clean_stats["events_ignored_duplicate"] + redelivered)
+    assert stats == expected                                                   # only these two counters may differ
+
+
+# ------------------------------------------------------------------ the horizon is bounded, first-in first-out, best effort
+def small_horizon(shipped: RuleSet, limit: int, **kw: Any) -> tuple[RuleEngine, ProcessGraph]:
+    return RuleEngine(shipped, endpoint_id=WIN, limits=EngineLimits(max_seen_events=limit), **kw), ProcessGraph()
+
+
+def test_the_horizon_holds_exactly_the_newest_accepted_ids_after_every_event(shipped):
+    engine, graph = small_horizon(shipped, 3)
+    ids: list[str] = []
+    for i in range(8):
+        event = mk(f"p{i}", i, binary=CMD)
+        assert feed(engine, graph, event).disposition == "evaluated"
+        ids.append(event.event_id)
+        assert list(engine._seen) == ids[-3:]                                  # never above the limit; oldest leaves first
+        assert engine.stats().seen_evicted == max(0, len(ids) - 3)
+
+
+def test_a_duplicate_delivery_does_not_renew_its_place_in_the_horizon(shipped):
+    engine, graph = small_horizon(shipped, 2)
+    first, second, third = (mk(name, t, binary=CMD) for t, name in enumerate(("a", "b", "c")))
+    feed(engine, graph, first)
+    feed(engine, graph, second)
+    assert feed(engine, graph, first).disposition == "duplicate"
+    feed(engine, graph, third)                                                 # evicts the oldest FIRST arrival, not least recently seen
+    assert list(engine._seen) == [second.event_id, third.event_id]
+    assert feed(engine, graph, second).disposition == "duplicate"
+    assert feed(engine, graph, first).disposition == "evaluated"               # forgotten: processed again, re-entering as the newest
+    assert list(engine._seen) == [third.event_id, first.event_id]
+    assert (engine.stats().events_evaluated, engine.stats().seen_evicted, engine.stats().events_ignored_duplicate) == (4, 2, 2)
+
+
+def test_skipped_events_take_no_place_in_a_full_horizon(shipped):
+    engine, graph = small_horizon(shipped, 2, clock=lambda: NOW + timedelta(seconds=10))
+    first, second = mk("a", 0, binary=CMD), mk("b", 1, binary=CMD)
+    feed(engine, graph, first)
+    feed(engine, graph, second)
+    skipped = [feed(engine, graph, mk("f", 2, endpoint="other-vm")),
+               feed(engine, graph, mk("a", 3, event_type="dns_query", dns={"query": "a.test"})),
+               feed(engine, graph, mk("late", 3600)),
+               engine.evaluate(graph, mk("never-applied", 4)),
+               feed(engine, graph, second)]
+    assert [r.disposition for r in skipped] == ["foreign", "no_rules", "future", "not_in_graph", "duplicate"]
+    assert list(engine._seen) == [first.event_id, second.event_id] and engine.stats().seen_evicted == 0
+    assert feed(engine, graph, first).disposition == "duplicate"
+
+
+def test_a_forgotten_seeded_start_is_counted_again(shipped):
+    engine, graph = small_horizon(shipped, 1)
+    seeded = mk("seed", 0, attributes={"placeholder": True, "ti_hash_hit": True})
+    feed(engine, graph, seeded)
+    feed(engine, graph, mk("b", 1, binary=CMD))                                # pushes the seeded start out of the horizon
+    assert feed(engine, graph, seeded).disposition == "evaluated"
+    assert engine.stats().placeholder_starts_skipped == 4                      # once per delivery the engine cannot recognize
+    assert suppression_counters(engine) == (0, 0, 0, 0)
 
 
 # ------------------------------------------------------------------ isolation, determinism, safety
