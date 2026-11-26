@@ -633,7 +633,6 @@ def test_reports_and_errors_survive_copy_and_pickle(shipped, tmp_path):
     assert pickle.loads(pickle.dumps(live.value)).args == live.value.args
 
 
-def test_the_package_surface_is_unchanged_by_this_step():
-    import nexus_endpoint_core as package
-    assert not hasattr(package, "RuleEngine")            # exports come with the engine itself, in a later step
+def test_the_engine_module_declares_its_public_names():
+    # The package-level exports are covered by test_public_api.py.
     assert set(engine_module.__all__) >= {"RuleEngine", "EngineLimits", "EngineResult", "EngineMatch", "RuleEngineError"}
