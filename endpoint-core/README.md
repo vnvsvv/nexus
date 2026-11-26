@@ -82,8 +82,13 @@ What the package's own tests do with the rule fixtures:
 
 CI (`.github/workflows/ci.yml`) uses Ubuntu and Python 3.11 and also runs the Linux endpoint tests, which need Linux.
 
-> **Temporary note (2026-11-26), delete once CI has passed on these commits:** the latest A3a commits are local and not
-> yet pushed. They have been tested only on Windows with Python 3.13; Python 3.11 and Linux CI are pending.
+**Recorded CI result.** GitHub Actions passed on commit `0a5f4d9`, both on the branch and merged with `main`
+(2026-11-26, Ubuntu, Python 3.11): 792 `endpoint-core` tests, 27 repository tests and 103 Linux endpoint tests. These
+counts are a snapshot of that run; for later commits, see the checks on the commit or pull request.
+
+* The Linux endpoint tests use recorded Tetragon samples and synthetic data. Passing them is **not** a test against a
+  live Tetragon sensor or a real endpoint, and none of them feeds the adapter's output to the rule engine.
+* Rule fixture replay and the ML feature-parity check were **skipped** in those runs, as described above.
 
 ## Run against the mock server, run in the lab
 Not applicable yet: nothing in this package talks to a server, and there is no agent loop (A8) to connect an adapter
