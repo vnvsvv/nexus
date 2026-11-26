@@ -35,19 +35,33 @@ Endpoint isolation
     of different endpoints never share a key.
 
 Deduplication is best effort, within a horizon
-    Duplicate event ids are recognized only while they are among the last ``max_seen_events`` tracked ids. An id that
-    was evicted from that set (counted in ``seen_evicted``) cannot be recognized without another source of truth, so
-    it is processed again; this is not lifetime idempotency. For a single rule the effect of a re-processed event is a
-    ``SuppressedMatch`` while its suppression entry lives, or a new ``EngineMatch`` after the entry expired or was
-    evicted, which A4 merges by root. Lifetime idempotency belongs to the store (A5).
+    The engine remembers the ids of the last ``max_seen_events`` successfully evaluated events: those that passed every
+    safeguard (disposition ``evaluated``, called "accepted" elsewhere in this module) and whose evaluation got as far
+    as recording the id, whether or not they matched, including events that only sequence or threshold steps listen to.
+    Events rejected or ignored before evaluation (every other disposition) are not recorded, and neither is an event
+    whose call fails before that point. Only the id is compared, so the first successfully evaluated arrival wins: while
+    its id is remembered, a later delivery never reaches the rules, even with different content, and does not renew the
+    id's place in the first-in, first-out order. The other safeguards, the graph lookup among them, run before the
+    duplicate check, so a redelivery is not always reported as ``duplicate`` (it is ``not_in_graph`` if its process has
+    left the graph).
+
+    This is not durable exactly-once processing. The memory lasts only as long as the engine, and an id that left the
+    horizon (counted in ``seen_evicted``) is processed again if redelivered. For an unchanged event that a single rule
+    had detected, the result is a ``SuppressedMatch`` if it selects the same root and the cap has not removed that
+    ``(rule, root)`` entry, even when later events have outlived the entry. After a removal, or under another root (the
+    graph may have changed), it is judged like any other detection and may be a new ``EngineMatch``. Merging such a
+    repeat by root is planned for the incident builder (A4), and lifetime idempotency for the store (A5); neither is
+    implemented yet, and this engine provides neither.
 
 Single rules
     A rule with ``kind: single`` is evaluated for events of its OS and event type with ``predicates.evaluate_where``;
     no regex runs unless an approved backend is installed. A ``process_start`` that is a seeded placeholder
-    (``attributes.placeholder`` or ``identity_resolution == "placeholder"``) was not observed and never matches
-    (counted in ``placeholder_starts_skipped``). A detection carries the event as evidence, the root process, the
-    placeholder and inferred-identity facts for A4, and the response target, and converts to the contract
-    ``RuleMatch`` with ``to_contract()``.
+    (``attributes.placeholder`` is True or ``identity_resolution == "placeholder"``) was not observed and never matches.
+    ``placeholder_starts_skipped`` counts the refused (rule, event) pairs, one for each rule whose predicates the event
+    satisfied; it does not count distinct process starts. Another event for the same placeholder process counts again.
+    A redelivery inside the dedup horizon does not, but one processed again after it does. A detection carries the
+    event as evidence, the root process, the placeholder and inferred-identity facts for A4, and the response target,
+    and converts to the contract ``RuleMatch`` with ``to_contract()``.
 
 Root selection (never decides whether a rule matches)
     From the process of the matching event, follow the OBSERVED parent links up to ``context.max_ancestors``
@@ -57,13 +71,24 @@ Root selection (never decides whether a rule matches)
     gap for A4 instead of filling it, and a stop-list boundary or the generation cap is not a gap.
 
 Suppression (sliding window, bounded)
-    State is keyed by ``(rule_id, root_process_instance_id)``. The first detection returns an ``EngineMatch``. A repeat
-    while ``event_time < last_hit + incident_window_seconds`` (half-open: a hit exactly at the end starts a new
-    match) returns a ``SuppressedMatch`` carrying the new evidence, and refreshes the window from the latest hit
-    (never backwards for a late event). Another rule on the same root, or the same rule on another root, is
-    independent. At most ``max_suppression_entries`` are kept: at the cap an expired entry is dropped first
-    (``suppression_expired``), otherwise the least recently updated live one (``suppression_evicted``, a possible
-    duplicate match). Suppression is therefore guaranteed only while its entry is retained, never for a lifetime.
+    State is keyed by ``(rule_id, root_process_instance_id)`` and judged by event timestamps, in whole milliseconds. A
+    detection with no entry for its key returns an ``EngineMatch`` and creates one that expires
+    ``incident_window_seconds`` later. While the entry is retained, a detection with ``event_time < expires_at`` returns
+    a ``SuppressedMatch`` carrying the new evidence; at ``expires_at`` or later it is a new match with a new window. A
+    repeat moves the expiry to the latest hit plus the window, never backwards: an event older than the latest hit is
+    still suppressed, however old, and leaves the window as it was. Another rule on the same root, or the same rule on
+    another root, is independent.
+
+    Expiry is lazy. Nothing sweeps by time, because an entry that has expired for one event may still be needed by a
+    late one. An entry stays until a detection for its own key finds it expired and replaces it, or the cap
+    (``max_suppression_entries``) removes it, so ``state_sizes()`` counts retained entries, expired ones included. If
+    adding a new key exceeds the cap, one other entry is removed. The first one, in least-recently-updated order (that of
+    processing, not of timestamps), that has expired AT THE NEW EVENT'S TIME is chosen (``suppression_expired``, which
+    also counts a same-key replacement). If none has, the least recently updated one goes (``suppression_evicted``, with
+    a rate-limited warning: its detection may fire again). Both labels are relative to that one event's time, not to
+    the whole stream: a future-dated event can remove as "expired" an entry that events arriving afterwards still
+    needed, and a late event can count as evicted an entry that newer events have already outlived. Suppression is
+    therefore guaranteed only while its entry is retained, never for a lifetime.
 
 Memory (counts, not bytes)
     Every runtime structure is bounded by an ``EngineLimits`` field, per key and globally, and starts empty:
@@ -240,10 +265,11 @@ class EngineStats:
     events_rejected_bad_identity: int = 0     # process_instance_id not prefixed with the event's endpoint_id
     seen_evicted: int = 0                     # tracked event ids dropped to honour max_seen_events (the horizon moved)
     matches_emitted: int = 0                  # new EngineMatch results
-    matches_suppressed: int = 0               # SuppressedMatch results (a repeat inside the window)
-    placeholder_starts_skipped: int = 0       # a seeded placeholder start that satisfied a rule and was refused as evidence
-    suppression_expired: int = 0              # expired suppression entries dropped: housekeeping, not a loss
-    suppression_evicted: int = 0              # LIVE suppression entries dropped at the cap: a possible duplicate match
+    matches_suppressed: int = 0               # SuppressedMatch results (a repeat before expiry, late ones included)
+    placeholder_starts_skipped: int = 0       # (rule, event) pairs refused: a seeded placeholder start satisfied the rule
+    # The next two are judged at the triggering event's time only (module docstring, "Suppression"):
+    suppression_expired: int = 0              # entries expired then: replaced by their key, or removed at the cap
+    suppression_evicted: int = 0              # entries live then but removed at the cap: a possible duplicate match
     rules_enabled: int = 0
     rules_disabled: int = 0
     rules_rejected_at_load: int = 0
@@ -295,10 +321,13 @@ class EngineMatch:
                                  matched_at_utc=format_utc(self.matched_at), bindings=dict(self.bindings))
 
 
+# TODO(A4): when building incidents, handle a repeat that is older than its incident or arrives after it closed, and
+# deduplicate evidence by event id (past the dedup horizon the same event can be reported again).
 @dataclass(frozen=True, eq=False)
 class SuppressedMatch:
-    """The same rule detected again for an active ``(rule, root)``: new evidence for A4 to append to the open
-    incident, not a new rule match."""
+    """The same rule detected again for a ``(rule, root)`` whose suppression entry has not expired at this event's
+    time. It is not a new rule match; the planned incident builder (A4) is to add its evidence to that detection's
+    incident."""
 
     rule: Rule
     root_process_instance_id: str
@@ -454,8 +483,11 @@ class RuleEngine:
         self._singles = self._build_singles()
         self._window_ms = {rule.id: round(rule.context.incident_window_seconds * 1000) for rule in self.enabled_rules}
         # Runtime state starts empty and only ever grows to its limit:
+        # TODO(A3b): sequence/threshold candidate state must deduplicate event ids itself (this horizon is bounded) and
+        # must not prune by the triggering event's time alone.
         self._seen: OrderedDict[str, None] = OrderedDict()                    # duplicate horizon (max_seen_events)
-        self._suppression: OrderedDict[tuple[str, str], tuple[int, int]] = OrderedDict()   # (rule, root) -> (last_ms, expires_ms)
+        # (rule, root) -> (last_ms, expires_ms), least recently updated first; expired entries stay until replaced/removed
+        self._suppression: OrderedDict[tuple[str, str], tuple[int, int]] = OrderedDict()
         self._counters = dict.fromkeys(_COUNTERS, 0)
         self._report_startup()
 
@@ -542,7 +574,11 @@ class RuleEngine:
         })
 
     def state_sizes(self) -> Mapping[str, int]:
-        """How many items of each runtime structure exist now. Structures a later step adds start at zero."""
+        """How many items each runtime structure retains now. Structures a later step adds start at zero.
+
+        These are retained items, not live ones: ``suppression_entries`` includes entries that have expired relative to a
+        later event and have not been replaced or removed.
+        """
         return MappingProxyType({"seen_events": len(self._seen), "suppression_entries": len(self._suppression)})
 
     def stats(self) -> EngineStats:
@@ -568,13 +604,22 @@ class RuleEngine:
         timestamp (live mode), presence of its process in the graph, whether any enabled rule listens to it,
         duplicate id (best effort, see the module docstring). An accepted event is evaluated against every enabled
         ``single`` rule of its OS and event type, in rule-id order; each qualifying detection is either a new
-        ``EngineMatch`` or, inside an active suppression window, a ``SuppressedMatch``. Sequence and threshold rules
-        are not evaluated yet. An exception from a regex backend propagates (a defect is not hidden). Evaluation is
-        prepared first and committed afterwards, so a failure leaves suppression state, detection counters and the seen
-        record untouched (only ``events_received`` counts the call) and the same event can be retried. Diagnostics are
-        logged only after the state is recorded, and a logging handler or filter that raises ``Exception`` is ignored
-        (see ``_log_safely``). ``MemoryError``, ``KeyboardInterrupt`` and ``SystemExit`` are not suppressed and no atomicity
-        is claimed for them or for process termination.
+        ``EngineMatch`` or, while its suppression entry has not expired at this event's time, a ``SuppressedMatch``.
+        Sequence and threshold rules are not evaluated yet. An exception from a regex backend propagates (a defect is
+        not hidden).
+
+        Exception safety: evaluation is prepared first and committed afterwards. An exception raised before the commit
+        leaves suppression state, detection counters, the seen record and the engine's identity untouched (only
+        ``events_received`` counts the call), so the same event can be retried. A skipped event differs: its skip counter
+        advances before its diagnostic is logged. Diagnostics are logged only after the state is recorded, and a logging
+        handler or filter that raises ``Exception`` is ignored (see ``_log_safely``).
+
+        The commit and the bookkeeping after it are not a transaction. ``MemoryError``, ``KeyboardInterrupt`` and
+        ``SystemExit`` are not suppressed; one raised during those updates may leave them partly applied, and one raised
+        at any point after the commit began loses this call's results. A retry cannot be relied on to recover them: it
+        reports ``duplicate`` if the id was recorded, and otherwise a detection whose suppression entry was already
+        written (and is still retained) comes back as a ``SuppressedMatch``. No atomicity is claimed from the commit
+        onwards, nor against process termination.
         """
         self._counters["events_received"] += 1
         if not event.process_instance_id.startswith(f"{event.endpoint_id}:"):
@@ -603,6 +648,7 @@ class RuleEngine:
 
         matches, suppressed, evictions = self._evaluate_singles(graph, event)
 
+        # TODO(A8): recover from a fatal error after the commit: the results are lost and a retry may not restore them.
         if self._endpoint_id is None:                                   # only an accepted event may fix the identity
             self._endpoint_id = event.endpoint_id
         self._os = event.os
@@ -632,10 +678,10 @@ class RuleEngine:
         resolution = event.attributes.get("identity_resolution")
         inferred = (event.event_id,) if isinstance(resolution, str) and resolution != "native" else ()
 
-        # Phase 1 - prepare. Everything that can fail (predicates, which may run a regex backend; root selection; building
-        # the result objects) happens here, and nothing in the engine is mutated: an exception leaves no trace, so a retry
-        # of the same event behaves as if the failed call never happened. Both possible results are built because
-        # whether a hit is new or a repeat is only known when it is committed.
+        # Phase 1 - prepare. The work a defect could break (predicates, which may run a regex backend; root selection;
+        # building the result objects) happens here, and nothing in the engine is mutated: an exception leaves no trace
+        # beyond events_received, so a retry of the same event behaves as if the failed call never happened. Both possible
+        # results are built because whether a hit is new or a repeat is only known when it is committed.
         prepared: list[tuple[tuple[str, str], int, EngineMatch, SuppressedMatch]] = []
         skipped_placeholders = 0
         for rule, step in singles:                                      # rule ids ascending
@@ -658,7 +704,8 @@ class RuleEngine:
             prepared.append(((rule.id, root.process_id), self._window_ms[rule.id], fresh, repeat))
 
         # Phase 2 - commit. Only dictionary and counter bookkeeping on values prepared above; no predicate, graph,
-        # object construction or logging runs here (warnings are returned and logged after the event is recorded).
+        # object construction or logging runs here (warnings are returned and logged after the event is recorded). It is
+        # not atomic: a fatal exception such as MemoryError can still interrupt it part way (see evaluate).
         self._counters["placeholder_starts_skipped"] += skipped_placeholders
         for key, window_ms, fresh, repeat in prepared:
             repeat_hit, evicted_so_far = self._register_hit(key, t_ms, window_ms)
@@ -675,26 +722,26 @@ class RuleEngine:
     def _register_hit(self, key: tuple[str, str], t_ms: int, window_ms: int) -> tuple[bool, int | None]:
         """Record a detection for ``key`` at event time ``t_ms``; never logs.
 
-        Returns ``(repeat, evicted_so_far)``: ``repeat`` is True if it repeats an active entry (suppressed);
-        ``evicted_so_far`` is the live-eviction count when this call should be reported (first, then every
-        ``_WARN_EVERY``-th), else None.
+        Returns ``(repeat, evicted_so_far)``: ``repeat`` is True if the key's entry has not expired at ``t_ms``
+        (suppressed); ``evicted_so_far`` is the live-eviction count when this call should be reported (first, then every
+        ``_WARN_EVERY``-th), else None. "Expired" and "live" below always mean at ``t_ms``.
         """
         entry = self._suppression.get(key)
-        if entry is not None and t_ms < entry[1]:                        # active: the window is half-open
+        if entry is not None and t_ms < entry[1]:                        # not expired: the window is half-open
             last = max(entry[0], t_ms)                                    # a late event never moves the window backwards
             self._suppression[key] = (last, last + window_ms)
             self._suppression.move_to_end(key)
             return True, None
-        if entry is not None:                                             # expired: this detection starts a new window
+        if entry is not None:                                             # expired at t_ms: a new window starts
             self._counters["suppression_expired"] += 1
             del self._suppression[key]
         self._suppression[key] = (t_ms, t_ms + window_ms)
         if len(self._suppression) > self.limits.max_suppression_entries:
             victim = next((k for k, (_, expires) in self._suppression.items() if expires <= t_ms and k != key), None)
-            if victim is not None:                                        # prefer an entry that has already expired
+            if victim is not None:                                        # prefer an entry that is expired at t_ms
                 del self._suppression[victim]
                 self._counters["suppression_expired"] += 1
-            else:                                                         # a live entry is lost: a repeat may fire again
+            else:                                                         # live at t_ms, lost: a repeat may fire again
                 self._suppression.popitem(last=False)
                 self._counters["suppression_evicted"] += 1
                 if self._counters["suppression_evicted"] == 1 or self._counters["suppression_evicted"] % _WARN_EVERY == 0:
