@@ -1,12 +1,54 @@
 # endpoint-core (`nexus_endpoint_core`)
 
 OS-agnostic core shared by the Linux and Windows agents (`docs/01-ARCHITECTURE.md` section 2.2). Input: `HostEvent`
-objects from an adapter. Output (later tasks): `Incident` and `ResponseResult` objects.
-Contracts are imported from `nexus_contracts`, never re-defined here.
+objects from an adapter. Intended output: `Incident` and `ResponseResult` objects, **neither of which is produced
+yet**. Contracts are imported from `nexus_contracts`, never re-defined here.
 
-**Status: tasks A1 and A2.** Implemented: `graph.py` (process graph) and `rules.py` (rule loading, validation and
-pre-compilation). Not yet: rule evaluation (A3), incident builder, store, transport, response gate, agent loop, replay,
-config (tasks A3 to A9, see `docs/06-SIX-WEEK-PLAN.md`).
+## Status
+Tasks A1, A2 and A3a are in the package. It is a set of library building blocks, **not a working agent or a complete
+detection pipeline**.
+
+**Implemented and tested**
+* A1, `graph.py`: the process graph.
+* A2, `rules.py`: rule loading, validation and pre-compilation.
+* A3a, `engine.py` and `predicates.py`: the rule engine's startup policy and per-event safeguards, evaluation of
+  `kind: single` rules, root selection, event-id deduplication and suppression.
+
+**Implemented, with limitations that matter**
+* Only single-event rules detect: see [Detection coverage](#detection-coverage-today).
+* `regex` predicates fail closed because no approved regex backend exists.
+* Known limits of the [graph](#known-limitations-of-the-graph), the
+  [rule loader](#known-limitations-and-open-questions-a2) and the [engine](#known-limitations-of-the-engine-a3a).
+
+**Not implemented**
+* A3b: sequence and threshold detection.
+* Incident builder (A4), SQLite store (A5), transport, response gate (A6), agent loop and configuration (A8) and
+  replay (A9). See `docs/01-ARCHITECTURE.md` section 2.2 and `docs/06-SIX-WEEK-PLAN.md`.
+
+## Detection coverage today
+> **Only `kind: single` rules detect anything.** Sequence and threshold rules load, are enabled and are indexed, but
+> they are **not evaluated**: their events are accepted and counted, and produce no match. `strict=True` does not
+> change this. It checks that startup is safe and that no rule was disabled or rejected, not that every enabled rule
+> can detect.
+
+| Shipped rule | OS | Kind | Evaluated now |
+|---|---|---|---|
+| `NX-ANY-001` | linux, windows | single | yes, see below |
+| `NX-LIN-001` | linux | sequence | **no** |
+| `NX-LIN-002` | linux | threshold | **no** |
+| `NX-LIN-003` | linux | sequence | **no** |
+| `NX-WIN-001` | windows | sequence | **no** |
+| `NX-WIN-002` | windows | single | yes |
+| `NX-WIN-003` | windows | threshold | **no** |
+
+* Of the shipped rules that apply to each OS, **Linux evaluates 1 of 4** and **Windows 2 of 4**.
+* `NX-ANY-001` needs the boolean `attributes.ti_hash_hit: true` on a `process_start`, set before `graph.apply`.
+* **Linux:** the engine can evaluate `NX-ANY-001` and matches a Linux event that carries that attribute. Nothing in this
+  repository populates it yet (the agent, A8, is meant to), and the other three shipped Linux rules need A3b. So
+  **automated Linux detection is not yet operational end to end**: on unenriched events no shipped Linux rule matches,
+  and nothing connects the Linux adapter to the engine.
+* A rule that uses `regex` is disabled (and `strict=True` refuses to start) unless an approved, time-bounded backend
+  is passed. `RegexBackend` is only the interface: **no implementation exists**. No shipped rule uses `regex`.
 
 ## Install (Python 3.11+, from the repository root)
 ```powershell
@@ -15,18 +57,42 @@ pip install -e .                                       # nexus_contracts first: 
 pip install -e "./endpoint-core[dev]"
 ```
 
-## Run the tests
+## Run
+There is nothing to start: this is a library with no executable (see the engine's [usage example](#usage-example)).
+Configuration (`.env.example`) arrives with `config.py` (A8).
+
+## Test with fixtures
 ```powershell
 pytest endpoint-core            # needs the editable install above; no path tricks
 pytest -q tests/                # contracts/tools tests (what a bare `pytest` at the root runs)
 python tools/validate_fixtures.py
 ```
-The rule-engine fixtures (`contracts/fixtures/rules/*`) are executed by `validate_fixtures.py` only after
-`replay.py` exists (task A9). Until then the graph tests only build graphs from those event files, and the rules
-tests load and validate the seven shipped rules without evaluating them.
+**A successful `validate_fixtures.py` does not mean the rule fixtures were executed.** It runs them only if
+`nexus_endpoint_core.replay` can be imported, and that module does not exist yet (A9). Until then it prints
+`nexus_endpoint_core not installed; rule fixtures schema-checked only`, even with the package installed, and still
+exits successfully: the events in `contracts/fixtures/rules/` are checked against the schema and the models, and the
+expected rule matches are not run. Its ML feature-parity check is likewise skipped when `nexus_ml` is not installed.
 
-Test with fixtures, run against the mock server, run in the lab: not applicable until the agent loop (A8) and the
-adapters exist; this README is extended then. Configuration (`.env.example`) arrives with `config.py` (A8).
+What the package's own tests do with the rule fixtures:
+* only `NX-LIN-001` and `NX-WIN-001` have them, and both are sequence rules, which are not evaluated yet;
+* the graph tests build graphs from the events, the predicate tests check that each step is satisfied by exactly its
+  expected event (and that the benign set satisfies only the first step), and an engine test replays the benign set to
+  check dispositions;
+* **no test runs a fixture as a detection**. The single rules are tested with events built inside the tests.
+
+CI (`.github/workflows/ci.yml`) uses Ubuntu and Python 3.11 and also runs the Linux endpoint tests, which need Linux.
+
+**Recorded CI result.** GitHub Actions passed on commit `0a5f4d9`, both on the branch and merged with `main`
+(2026-11-26, Ubuntu, Python 3.11): 792 `endpoint-core` tests, 27 repository tests and 103 Linux endpoint tests. These
+counts are a snapshot of that run; for later commits, see the checks on the commit or pull request.
+
+* The Linux endpoint tests use recorded Tetragon samples and synthetic data. Passing them is **not** a test against a
+  live Tetragon sensor or a real endpoint, and none of them feeds the adapter's output to the rule engine.
+* Rule fixture replay and the ML feature-parity check were **skipped** in those runs, as described above.
+
+## Run against the mock server, run in the lab
+Not applicable yet: nothing in this package talks to a server, and there is no agent loop (A8) to connect an adapter
+to it. The adapter in `endpoint-linux/` runs on its own and does not call the rule engine.
 
 ## Process graph (`nexus_endpoint_core.graph`)
 ```python
@@ -36,16 +102,27 @@ g = ProcessGraph(retention_seconds=600, max_nodes=50_000, max_events=100_000,
 node = g.apply(host_event)        # -> ProcessNode, or None for the exit of a process never seen
 g.ancestors(id, max_depth=5); g.descendants(id, max_depth=5, since=None)
 g.lineage_contains(candidate, root, max_depth, include_self=False)
-g.events_for(node_ids, event_types, window=(lo, hi)); g.gc(now=None)
+g.events_for(node_ids, types, window=(lo, hi)); g.gc(now=None)
 ```
 `graph.ProcessNode` is the runtime node (children, event references). It is not the contract
-`nexus_contracts.ProcessNode`; the incident builder (A4) converts. Nodes compare by identity and are hashable.
+`nexus_contracts.ProcessNode`; the planned incident builder (A4) will convert. Nodes compare by identity and are
+hashable.
 
 * **Identity.** Keyed by `process_instance_id` only. PID is display/fallback (`live_by_pid`, `live_node_for_pid`).
 * **Placeholders.** An unknown parent, or an event from a process whose start was never seen, creates a node with
-  `placeholder=True`, `binary="<unknown>"` (or the event's binary), no start time, no invented parent. A real start
-  later upgrades it in place and keeps children, events and every field the start does not repeat. An adapter can
-  seed a placeholder with `attributes.placeholder=true` or `identity_resolution="placeholder"` on a `process_start`.
+  `placeholder=True`, `binary="<unknown>"` (or the event's binary), no invented parent, and no start time unless an
+  event reports `process_start_time_utc`. A real start later upgrades it in place and keeps children, events and every
+  field the start does not repeat. An adapter can seed a placeholder with `attributes.placeholder=true` or
+  `attributes.identity_resolution="placeholder"` on a `process_start`.
+* **Unresolved ancestry.** `ProcessNode.parent_unresolved` (`str | None`) keeps the first non-empty string that any
+  applied event of the process carried in `attributes.parent_unresolved`: a start (also a repeated one that is not
+  cached), a file, network or DNS event, or an exit. A later different reason, an event without one, a placeholder
+  upgrade or a parent established later never changes or clears it. It is **history, not the current relationship**:
+  it is separate from `parent_process_instance_id`, links nothing, creates no placeholder and leaves
+  `identity_resolution` and `placeholder` alone. It is runtime-only (not in any contract) and holds no event id. It
+  survives event-cache eviction, but not node removal (`gc`) or a restart. The exit of a process never seen, and a
+  duplicate `event_id` still in the cache, record nothing. See
+  [unresolved ancestry](#unresolved-ancestry-requirement-for-a4) for what A4 must do with it.
 * **Exits and PID reuse.** `end_time_utc` comes only from an observed exit. If a newer start takes over a PID whose
   holder never exited, the old node gets `superseded_by` / `superseded_at_utc` and stays `end_time_utc=None`;
   an older start arriving late never takes the PID. `node.is_live` (false for exited and superseded) is required
@@ -74,14 +151,16 @@ g.events_for(node_ids, event_types, window=(lo, hi)); g.gc(now=None)
 
 ### Known limitations of the graph
 Single-threaded; sensor event order is assumed (an exit before its start is ignored); the event cache is FIFO, not
-LRU, and may evict an old start event of a long-lived process (the SQLite store keeps full copies, task A5); a
-forced eviction can leave a child pointing at a removed parent (`ancestors` stops there; the incident builder must
-report `PARENT_NOT_OBSERVED`; if the same `process_instance_id` comes back, the parent regains its surviving children); `apply` raises `ValueError` on a malformed timestamp, so the agent loop wraps it per
+LRU, and may evict an old start event of a long-lived process (the planned SQLite store, A5, is to keep full copies); a
+forced eviction can leave a child pointing at a removed parent (`ancestors` stops there; the planned incident builder
+must report `PARENT_NOT_OBSERVED`; if the same `process_instance_id` comes back, the parent regains its surviving
+children); `apply` raises `ValueError` on a malformed timestamp, so the caller (the agent loop, A8) must handle it per
 event; datetimes passed in must be timezone-aware.
 
 ## Rules loader (`nexus_endpoint_core.rules`, task A2)
 Turns `contracts/rules/*.yaml` (format: `contracts/rules/RULE-FORMAT.md`) into immutable, validated rule objects with
-regexes and CIDR networks compiled once. It does **not** evaluate rules; matching is task A3.
+regexes and CIDR networks compiled once. The loader never looks at events: evaluation is done by the
+[rule engine](#rule-engine-a3a), so far for `single` rules only.
 ```python
 from nexus_endpoint_core import load_rules, load_rule, load_attack_mapping
 rules = load_rules("contracts/rules")                   # RuleSet: .rules (sorted by id), .errors, .get(id), .for_os("linux")
@@ -113,10 +192,10 @@ regex compilation failures (`re.error`, `OverflowError`, `RecursionError`) rejec
 `__cause__`), logs it with its traceback and continues; `strict=True` raises `RuleLoadError`. `KeyboardInterrupt` and
 `SystemExit` are never caught, and `load_rule` itself does not hide a defect.
 
-**ATT&CK mapping.** An explicit `attack_mapping=` is always required. Otherwise `<rules dir>/../attack-mapping.yaml` is
-used when it exists. When it does not exist the check is skipped for an independent directory, but never for the
-repository layout `contracts/rules`, where a missing mapping raises `AttackMappingError`. With a mapping, each rule's
-`technique_ids` must exist in it and equal its list for that rule id.
+**ATT&CK mapping.** An explicit `attack_mapping=` must exist and be well formed. Without one,
+`<rules dir>/../attack-mapping.yaml` is used when it exists. When it does not exist the check is skipped for an
+independent directory, but never for the repository layout `contracts/rules`, where a missing mapping raises
+`AttackMappingError`. With a mapping, each rule's `technique_ids` must exist in it and equal its list for that rule id.
 
 **What is validated** (decisions where `RULE-FORMAT.md` is silent; none changes a contract): unknown keys are errors; `context`
 requires `max_descendant_depth` and `incident_window_seconds` (`max_ancestors` defaults to 3); `window_seconds` is required
@@ -132,7 +211,7 @@ other steps (earlier ones in an ordered rule, no cycles otherwise) and `descenda
 with a safe loader that rejects duplicate keys, anchors/aliases, extra documents, deep nesting, files over 64 KiB and
 non-UTF-8 text.
 
-### Regex safety (read before implementing A3)
+### Regex safety (read before adding a regex backend)
 The `regex` operator is kept, but Python's `re` backtracks and has **no timeout**: `(a+)+$` needs seconds on 26 characters of
 attacker-controlled text and doubles with each one. Loading applies a conservative lexical screen. It is a **heuristic, not a
 guarantee** (it uses no private `re` internals): it refuses nested unbounded repetition (`(a+)+`, `(.*a)*`, `(\d+\.)+`),
@@ -141,9 +220,10 @@ nested counts multiplying above 10,000, verbose `(?x)` patterns and syntax it ca
 possessive quantifiers (Python 3.11+) are the escape hatch. It does **not** catch polynomial blow-ups such as `.*.*x`, it
 refuses some harmless patterns, and it proves nothing about an accepted one. No shipped rule uses `regex`.
 
-**Mandatory for A3** (the loader cannot provide these): never run a rule regex on event text in the evaluation path without
-a hard time bound; **input truncation alone is not sufficient**, since an exponential pattern is already slow at about 30
-characters. A real timeout is an architectural decision that is deliberately not taken here:
+**Mandatory at evaluation time** (the loader cannot provide this): never run a rule regex on event text in the evaluation
+path without a hard time bound; **input truncation alone is not sufficient**, since an exponential pattern is already slow
+at about 30 characters. How to provide a real timeout is an architectural decision that has **not** been taken. Until it
+is, the engine behaves as option (d) below.
 * **(a) the third-party `regex` package** with `search(..., timeout=...)`: one new binary dependency, nearly source compatible;
 * **(b) RE2** (`google-re2`): linear time by construction, new dependency, but no back-references or look-around, so some
   accepted patterns would have to be refused;
@@ -152,10 +232,269 @@ characters. A real timeout is an architectural decision that is deliberately not
 
 ### Known limitations and open questions (A2)
 * **`scope: lineage(N)`** is parsed and its depth kept, but `RULE-FORMAT.md` does not define what it traverses
-  (descendants only, or ancestors and descendants). Nothing here interprets it, and **its exact evaluation semantics must
-  be confirmed before A3 evaluates threshold rules with that scope**. No shipped rule uses it.
-* Windows string normalization (case, slashes) is applied at match time in A3, not here, because `NX-ANY-001` covers both
-  OSes; operands are kept as authored (enum values canonicalized as described). Regexes carry no flags and run with
-  `re.search`; see **Regex safety** above for what A3 must add.
-* Five of the seven shipped rules have no sibling fixtures yet (`RULE-FORMAT.md` asks for them); they are an A3 deliverable.
+  (descendants only, or ancestors and descendants). Nothing interprets it, and **its exact evaluation semantics must
+  be confirmed before A3b evaluates threshold rules with that scope**. No shipped rule uses it.
+* Windows string normalization (case, slashes) is applied at match time (`predicates.py`), not here, because
+  `NX-ANY-001` covers both OSes; operands are kept as authored (enum values canonicalized as described). Regexes are
+  compiled without flags, but the engine never runs the compiled pattern: an approved backend would receive the pattern
+  text and the raw event text (`RULE-FORMAT.md` defines `regex` as Python `re.search`).
+* Five of the seven shipped rules have no sibling fixtures yet (`RULE-FORMAT.md` asks for them); they are still owed
+  from task A3. Neither single rule has one.
 * The ATT&CK check mirrors `tools/validate_fixtures.py` (exact ordered list equality).
+
+## Rule engine (A3a)
+`engine.py` evaluates one `HostEvent` at a time against the loaded rules, using the process graph; `predicates.py` tests
+a step's `where` against an event. (`docs/01-ARCHITECTURE.md` section 2.2 places evaluation in `rules.py`; it is
+implemented in these two modules.) The engine returns **results**, not incidents: it builds no `Incident`, stores and
+sends nothing, and performs **no response**. The docstring of `engine.py` is the detailed reference.
+
+These names are importable from `nexus_endpoint_core`: `RuleEngine`, `EngineLimits`, `EngineStats`, `EngineResult`,
+`EngineMatch`, `SuppressedMatch`, `DisabledRule`, `RuleEngineError`, `DEFAULT_ROOT_STOP_BINARIES`, `RegexBackend` and
+`RegexTimeout`. The annotation types `Disposition` and `IndexEntry` come from `nexus_endpoint_core.engine`; the
+predicate helpers stay in `nexus_endpoint_core.predicates`.
+
+### Usage example
+Run from the repository root. It builds events by hand; in an agent they would come from an adapter.
+```python
+from nexus_contracts import HostEvent
+from nexus_endpoint_core import ProcessGraph, RuleEngine, load_rules
+
+ENDPOINT = "windows-vm-01"
+
+
+def start(number: int, name: str, binary: str, parent: str | None = None) -> HostEvent:
+    return HostEvent(
+        event_id=f"{ENDPOINT}:evt-{number:012x}", endpoint_id=ENDPOINT, os="windows", event_type="process_start",
+        timestamp_utc=f"2026-11-15T10:00:{number:02d}.000Z", process_instance_id=f"{ENDPOINT}:{name}",
+        parent_process_instance_id=f"{ENDPOINT}:{parent}" if parent else None, pid=1000 + number, binary=binary)
+
+
+rules = load_rules("contracts/rules", strict=True)
+graph = ProcessGraph()
+engine = RuleEngine(rules, endpoint_id=ENDPOINT, strict=True)
+
+events = [start(1, "shell", "C:\\Windows\\System32\\cmd.exe"),
+          start(2, "first", "C:\\Lab\\bin\\lab-test.exe", parent="shell"),
+          start(3, "second", "C:\\Lab\\bin\\lab-test.exe", parent="shell")]
+
+for event in events:
+    try:
+        graph.apply(event)                      # 1. always first
+    except ValueError:                          #    malformed timestamp: the graph is unchanged, so do not evaluate
+        continue
+    result = engine.evaluate(graph, event)      # 2. immediately afterwards, once per event
+    print(result.disposition, len(result.matches), len(result.suppressed))
+    for match in result.matches:
+        print("  new:", match.rule.id, match.root_process_instance_id, match.to_contract().bindings)
+    for repeat in result.suppressed:
+        print("  repeat:", repeat.rule.id, repeat.trigger_event_id)
+```
+Output:
+```text
+evaluated 0 0
+evaluated 1 0
+  new: NX-WIN-002 windows-vm-01:shell {'bin': 'windows-vm-01:evt-000000000002'}
+evaluated 0 1
+  repeat: NX-WIN-002 windows-vm-01:evt-000000000003
+```
+
+### Construction
+```python
+RuleEngine(rules, *, limits=None, regex_backend=None, strict=False, clock=None, endpoint_id=None,
+           root_stop_binaries=DEFAULT_ROOT_STOP_BINARIES)
+```
+| Argument | Meaning |
+|---|---|
+| `rules` | A `RuleSet`, or an iterable of validated `Rule` objects. Only a `RuleSet` carries the loader's rejected rules. |
+| `limits` | An `EngineLimits`; the defaults when omitted. |
+| `regex_backend` | An object with `search(pattern, text) -> bool` that declares `enforces_time_limit = True`. None exists today; the declaration is not proof, so a backend needs its own review. |
+| `strict` | Refuse to start instead of running with reduced coverage (below). |
+| `clock` | Live mode: returns a timezone-aware `datetime`. Omit for deterministic replay. |
+| `endpoint_id` | The endpoint served (lowercase letters, digits, `-`). **A live deployment must pass it.** |
+| `root_stop_binaries` | Bare file names that root selection never climbs into. Replaces the default list; `()` disables it. |
+
+A wrong argument type raises `TypeError`; a bad `endpoint_id` or stop-list entry, or duplicate rule ids, raise
+`ValueError`. `RuleEngineError` (a `ValueError`) covers the startup refusals below and carries `.disabled` and
+`.load_errors`.
+
+### Startup: `strict` and disabled rules
+A rule is **disabled** when it cannot be evaluated safely: it uses `regex` and there is no approved backend
+(`regex_backend_unavailable`), or its `min_distinct` exceeds `max_values_per_key` (`min_distinct_exceeds_limit`).
+
+| Situation | `strict=False` | `strict=True` (intended for the live agent) |
+|---|---|---|
+| A disabled rule | listed in `engine.disabled_rules`, logged, not indexed | `RuleEngineError` |
+| A rule the loader rejected (`RuleSet.errors`) | listed in `engine.load_errors`, logged | `RuleEngineError` |
+| No enabled rule | warning; the engine detects nothing | `RuleEngineError` |
+| Sequence rules need more candidate slots than `max_total_candidate_events` | `RuleEngineError` | `RuleEngineError` |
+
+This is separate from `load_rules(..., strict=True)`, which refuses at load time.
+
+### Calling contract
+* **One engine and one graph per endpoint, used from a single thread.**
+* Call `graph.apply(event)`, then `engine.evaluate(graph, event)` immediately, once per event and in the same order.
+  If a later `apply` or `gc` removes the process first, the result is `not_in_graph`.
+* Set enrichment such as `attributes.ti_hash_hit` on the event **before** `graph.apply`.
+* The engine only reads the graph and the event.
+* In live use pass `clock=lambda: datetime.now(timezone.utc)` to the engine and to the graph. The engine then ignores
+  events more than `max_future_skew_seconds` ahead of the clock. Without a clock it reads no wall time.
+* An engine serves one endpoint and one OS. Without `endpoint_id`, the first accepted event fixes the endpoint (tests
+  and replay only); the first accepted event always fixes the OS. Every other endpoint or OS is rejected.
+
+### How predicates match
+A missing value never matches, for any operator (including `not_in_cidr`), and the binary `<unknown>` counts as
+missing. Comparisons are typed (`True` is not `1`, `"80"` is not `80`). Windows string comparisons ignore case and treat
+`\` as `/`; Linux comparisons are exact. `network.dst_ip` is compared as an address by `equals`, `in` and the CIDR
+operators. `regex` goes only to the backend, on raw text: text over 4096 characters is not sent and a `RegexTimeout` is
+no match, while any other backend exception propagates.
+
+### Results
+`evaluate` returns an `EngineResult(matches, suppressed, disposition)`. The checks run in the order below, and the first
+one that applies decides the disposition. Each has its own `EngineStats` counter.
+
+| `disposition` | Meaning | Counter |
+|---|---|---|
+| `bad_identity` | `process_instance_id` is not prefixed with the event's `endpoint_id` | `events_rejected_bad_identity` |
+| `foreign` | another endpoint or OS | `events_rejected_foreign` |
+| `future` | live mode only: too far ahead of the clock | `events_ignored_future` |
+| `not_in_graph` | its process is not in the graph (`apply` skipped, node removed, or the exit of a process never seen) | `events_ignored_not_in_graph` |
+| `no_rules` | no enabled rule listens to this OS and event type | `events_ignored_no_rules` |
+| `duplicate` | the event id is already remembered | `events_ignored_duplicate` |
+| `evaluated` | passed every check ("accepted"), with or without a match | `events_evaluated` |
+
+`evaluated` does not mean a rule ran: an event that only sequence or threshold steps listen to is `evaluated` and
+detects nothing. Matches and suppressed repeats are tuples in rule-id order. Results are immutable.
+
+**`EngineMatch`** is a new detection:
+* what matched: `rule`, `bindings` (step name to event id), `events` (step name to `HostEvent`), `trigger_event_id`,
+  `matched_at`, `process_by_step`;
+* the root and facts for an incident builder: `root_process_instance_id`, `root_parent_is_placeholder`,
+  `root_parent_missing`, `placeholder_process_ids`, `identity_inferred_event_ids`. These do not cover
+  [unresolved ancestry](#unresolved-ancestry-requirement-for-a4);
+* `response_target_process_id`, set when the rule declares a response. It is **only a request: nothing is terminated**;
+* `counted_process_id` and `distinct_count` belong to threshold rules and are always `None` today.
+
+`to_contract()` returns a `nexus_contracts.RuleMatch` (`rule_id`, `rule_version`, `matched_at_utc`, `bindings`).
+
+**`SuppressedMatch`** is a repeat of a detection: `rule`, `root_process_instance_id`, `matched_at`, `trigger_event_id`,
+`bindings`, `events`. It is not a new rule match and has no `to_contract()`; the planned incident builder is to add it
+to the incident as evidence.
+
+A seeded placeholder `process_start` (see [Placeholders](#process-graph-nexus_endpoint_coregraph)) was not observed and
+never matches. `placeholder_starts_skipped` counts the refused (rule, event) pairs, not processes.
+
+### Root selection
+From the matching process, the engine follows observed parent links up to the rule's `context.max_ancestors`
+generations. It stops before a parent that is missing, a placeholder, already visited, or named in the stop list
+(`DEFAULT_ROOT_STOP_BINARIES`, for example `systemd`, `sshd`, `explorer.exe`, `svchost.exe`; compared by file name,
+ignoring case). Nothing is invented: a missing or placeholder parent of the root is reported in the match. A parent
+that the sensor reported as unresolved is **not** (next section). Root selection never decides whether a rule matches.
+
+### Unresolved ancestry (requirement for A4)
+**Process identity confidence and ancestry completeness are independent.** The Linux adapter can report an observed
+process with a trustworthy identity (`attributes.identity_resolution="native"`) whose ancestry it could not resolve:
+`attributes.parent_unresolved` is `"sensor_task_walk"` or `"conflicting_sensor_parent"`, and the event has no
+`parent_process_instance_id`. Such a `process_start` matches like any other. Unless an earlier event already gave the
+process a parent, it is its own root, `identity_inferred_event_ids` and `placeholder_process_ids` stay empty, and both
+`root_parent_missing` and `root_parent_is_placeholder` are `False`.
+
+**`root_parent_missing=False` does not prove that the ancestry is complete.** The flag is `True` only when the root
+records a parent id whose node is not in the graph. With no parent id it is `False`, whatever the sensor said about why.
+
+The graph keeps the first reason of each process on its node, `ProcessNode.parent_unresolved` (see
+[Process graph](#process-graph-nexus_endpoint_coregraph)), so it outlives the event that carried it. The engine's
+results do not report it. The incident builder (A4, not implemented yet) **MUST**:
+1. read `graph.get(process_id).parent_unresolved` for every process on the path from the matching one up to the root,
+   right after `evaluate` and before the next `apply` or `gc`. Bound events are not enough: when a child matches and
+   the root is an unresolved ancestor, no event in the match carries the reason;
+2. also inspect the attributes of every bound `HostEvent`, in `EngineMatch.events` and `SuppressedMatch.events`. The
+   node keeps only the first reason, and these events are evidence A4 actually holds;
+3. read the field as **historical sensor uncertainty**. For each process that has a reason, judge the current
+   relationship separately, from the node's `parent_process_instance_id` and the parent node:
+
+   | The process's current parent | What A4 reports |
+   |---|---|
+   | no `parent_process_instance_id` | the parent is currently missing: an evidence gap (the contract's `PARENT_NOT_OBSERVED` code fits), with the reason in its message |
+   | a parent id whose node is gone, or is a placeholder | the parent is still not observed: the same gap |
+   | a parent node that is present and not a placeholder | the relationship was established and stands on its own evidence. Do not report that parent as missing; keep the reason as a historical note (the `OTHER` code fits) |
+
+   The field does not say whether the reason was reported before or after the parent link;
+4. never add or remove a parent relationship because of the reason, or treat the process identity as inferred because
+   of it;
+5. not invent an `evidence_event_id`. The node records no event id, and the original event may have been evicted. Cite
+   an event only if A4 holds the `HostEvent` that carries the reason (bound, or still cached); otherwise report the
+   reason without one. A retained reason is diagnostic metadata, not durable source evidence.
+
+**No reason is not proof of completeness.** It only means that none was found: the metadata lives in memory, so
+removing a node (`gc`, `max_nodes`) or restarting loses it until persistence (A5) is implemented. A node created
+again under the same id starts without it.
+
+### Deduplication (best effort, bounded)
+* The engine remembers the ids of the last `max_seen_events` evaluated events, matching or not. Skipped events are not
+  remembered.
+* Only the id is compared: the first evaluated arrival wins, and a redelivery does not renew its place (first in, first
+  out). Earlier checks still apply, so a redelivery can also be reported as, for example, `not_in_graph`.
+* It is **not exactly-once processing**. After an id leaves the horizon (`seen_evicted`) or the engine restarts, a
+  redelivery is evaluated again and, depending on suppression state and the root, may be reported again.
+
+### Suppression (bounded, in memory)
+* Keyed by `(rule_id, root_process_instance_id)`, judged by **event timestamps** in whole milliseconds, using the
+  rule's `context.incident_window_seconds`.
+* While the key's entry is retained, a repeat stamped before its expiry is a `SuppressedMatch`; one at or after it is a
+  new `EngineMatch`.
+* The window **slides**: a repeat inside it moves the expiry to the latest hit plus the window. While the entry is
+  retained, matching activity that continues without a gap of a whole window therefore keeps it active, with no new
+  `EngineMatch` for that key. An older, late event is suppressed too and never moves the window back.
+* This is suppression state only. A3a has **no incident lifecycle** (A4): the window does not open, extend or close an
+  incident. (`docs/02-CORRELATION.md` section 3 words this as firing once per `incident_window_seconds`; the engine does
+  not fire again merely because that long has passed since the first hit.)
+* Expired entries are not swept. They stay until the same key replaces them or the `max_suppression_entries` cap removes
+  one: an entry expired at the new event's time if there is one (`suppression_expired`, also counted on replacement),
+  otherwise the least recently updated (`suppression_evicted`: that detection may fire again). Both counters are
+  relative to the triggering event's time, so out-of-order or future-dated events can make either label misleading.
+* The state is **not durable**: after a restart, a repeat that would have been suppressed is reported as new.
+
+### Limits (`EngineLimits`)
+Counts of items, not bytes. Invalid or mutually inconsistent values raise `ValueError`.
+
+| Field | Default | Effect in A3a |
+|---|---|---|
+| `max_seen_events` | 50000 | deduplication horizon |
+| `max_suppression_entries` | 4096 | suppression cap |
+| `max_future_skew_seconds` | 300 | live mode future check |
+| `max_candidates_per_step` | 128 | startup capacity check only |
+| `max_total_candidate_events` | 50000 | startup capacity check only |
+| `max_values_per_key` | 128 | disables threshold rules whose `min_distinct` is larger |
+| `max_search_candidates` | 64 | reserved for A3b (validated) |
+| `max_search_nodes` | 2000 | reserved for A3b (validated) |
+| `max_threshold_keys` | 1024 | reserved for A3b (validated, shown by `state_bounds()`) |
+| `max_threshold_bindings` | 200 | reserved for A3b (validated) |
+
+### Statistics and state
+* `engine.stats()` returns an `EngineStats` snapshot: the counters above plus `events_received`, `seen_evicted`,
+  `matches_emitted`, `matches_suppressed`, `placeholder_starts_skipped`, `suppression_expired`,
+  `suppression_evicted`, `rules_enabled`, `rules_disabled` and `rules_rejected_at_load`.
+* `engine.state_bounds()` gives upper bounds in item counts (`seen_event_ids`, `suppression_entries`,
+  `candidate_events`, `threshold_keys`, `threshold_value_records`; the last three describe A3b structures that do not
+  exist yet).
+* `engine.state_sizes()` gives what is retained now (`seen_events`, `suppression_entries`), including expired entries.
+* Also: `enabled_rules`, `disabled_rules`, `load_errors`, `endpoint_id`, `arrival_count` and
+  `index_for(os_name, event_type)`, which lists listening steps, including ones that are not evaluated yet.
+
+### Errors
+An exception raised while an event is being prepared (for example by a regex backend) propagates and leaves suppression
+state, detection counters and the seen record unchanged (`events_received` still counts the call), so the event can be
+retried. A logging handler or filter that raises an ordinary exception during `evaluate` is ignored. `MemoryError`,
+`KeyboardInterrupt` and `SystemExit` are not suppressed and updates are not transactional: one raised after the commit
+began loses that call's results, and a retry may not recover them. Recovery is left to the agent loop (A8).
+
+### Known limitations of the engine (A3a)
+* No sequence or threshold detection ([Detection coverage](#detection-coverage-today)), and no regex backend.
+* Single-threaded.
+* Deduplication and suppression are bounded, in-memory and best effort; neither survives a restart.
+* No incident builder, persistence, transport or response, and no agent loop that connects it to an adapter.
+* No result field reports `parent_unresolved`; it is read from the graph node, which holds only the first reason, no
+  event id, and loses it when the node is removed or on restart
+  ([unresolved ancestry](#unresolved-ancestry-requirement-for-a4)).
+* A tiny `incident_window_seconds` is accepted but rounded to whole milliseconds: 0.0005 s or less becomes 0 ms, and
+  repeats stamped at or after the latest hit are then reported as new matches. The shipped rules use 60 and 120 s.
