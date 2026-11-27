@@ -9,14 +9,25 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install -e . && pip install fastapi uvicorn httpx pytest
       - run: pip install -e ./endpoint-core   # before validate_fixtures so the rule-engine fixtures run once replay.py exists
-      - run: python tools/validate_fixtures.py
+      # ML: once ml/ exists it is installed before validate_fixtures, which then requires feature parity (no skip).
+      - name: Install nexus_ml
+        if: hashFiles('ml/**') != ''
+        run: pip install -e ./ml
+      - name: Validate fixtures
+        if: hashFiles('ml/**') == ''
+        run: python tools/validate_fixtures.py
+      - name: Validate fixtures (ML feature parity required)
+        if: hashFiles('ml/**') != ''
+        run: python tools/validate_fixtures.py --require-ml
       - run: pytest -q tests/
       - run: pytest -q endpoint-core
       - name: Linux endpoint regression tests
         run: PYTHONPATH=.:endpoint-linux pytest -q endpoint-linux/tests
+      - name: ML tests
+        if: hashFiles('ml/**') != ''
+        run: pytest -q ml
       - run: python tools/lint_sysmon_config.py
       - run: python tools/check_samples.py
       # Each owner adds a job for their package when it exists:
-      # - run: pip install -e ./ml && pytest -q ml
       # - run: pip install -e ./server && pytest -q server
       # - run: cd dashboard && npm ci && npm run typecheck && npm run build

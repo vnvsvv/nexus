@@ -4,7 +4,12 @@ One ordered vector, 24 features, produced identically by:
 - `nexus_ml.features.from_dataset_row(row: dict) -> list[float]` (training; UQ NetFlow v2 CSV columns), and
 - `nexus_ml.features.from_nflow(flow: nfstream.NFlow) -> list[float]` (live; gateway `flow_service`).
 
-Both must reproduce `contracts/fixtures/flow_feature_fixture.json` exactly (`tools/validate_fixtures.py` checks it when `nexus_ml` is importable). The server refuses a model bundle whose `features.json` order or `feature_version` differs.
+Both must reproduce `contracts/fixtures/flow_feature_fixture.json` under the comparison below (`tools/validate_fixtures.py` checks it when `nexus_ml` is importable; with `--require-ml`, as in CI once `ml/` exists, a missing `nexus_ml` fails). The server refuses a model bundle whose `features.json` order or `feature_version` differs.
+
+**Fixture comparison** (`tools/feature_parity.py`):
+- **Exact:** `feature_version`, the 24 feature names and their order, the vector length, and the 19 integer features (`int` in `nexus_contracts.NfLite1`).
+- **Tolerance for the 5 computed float features** (`float` in `NfLite1`: `mean_pkt_size` and features 16–19): `math.isclose(computed, expected, rel_tol=1e-12, abs_tol=1e-12)`. This absorbs floating-point evaluation order, not a different formula: the fixture's `src_to_dst_second_bytes` (`867.8160919540229`) is one unit in the last place below `1812 / 2088 * 1000`, while an off-by-one millisecond denominator differs by about 5e-4.
+- **Always a failure:** NaN, infinity, a non-numeric value, and a missing or extra feature.
 
 NFStreamer settings on the gateway: `statistical_analysis=True`, `splt_analysis=0`, `n_dissections=20`, `idle_timeout=15`, `active_timeout=60`, `accounting_mode=1` (IP size), plus the `PacketSizeBins` NFPlugin (below).
 
