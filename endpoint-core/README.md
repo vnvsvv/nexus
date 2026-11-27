@@ -359,8 +359,9 @@ detects nothing. Matches and suppressed repeats are tuples in rule-id order. Res
 **`EngineMatch`** is a new detection:
 * what matched: `rule`, `bindings` (step name to event id), `events` (step name to `HostEvent`), `trigger_event_id`,
   `matched_at`, `process_by_step`;
-* the root and the facts an incident builder needs: `root_process_instance_id`, `root_parent_is_placeholder`,
-  `root_parent_missing`, `placeholder_process_ids`, `identity_inferred_event_ids`;
+* the root and facts for an incident builder: `root_process_instance_id`, `root_parent_is_placeholder`,
+  `root_parent_missing`, `placeholder_process_ids`, `identity_inferred_event_ids`. These do not cover
+  [unresolved ancestry](#unresolved-ancestry-requirement-for-a4);
 * `response_target_process_id`, set when the rule declares a response. It is **only a request: nothing is terminated**;
 * `counted_process_id` and `distinct_count` belong to threshold rules and are always `None` today.
 
@@ -377,8 +378,34 @@ never matches. `placeholder_starts_skipped` counts the refused (rule, event) pai
 From the matching process, the engine follows observed parent links up to the rule's `context.max_ancestors`
 generations. It stops before a parent that is missing, a placeholder, already visited, or named in the stop list
 (`DEFAULT_ROOT_STOP_BINARIES`, for example `systemd`, `sshd`, `explorer.exe`, `svchost.exe`; compared by file name,
-ignoring case). Nothing is invented: a missing or placeholder parent of the root is reported in the match. Root
-selection never decides whether a rule matches.
+ignoring case). Nothing is invented: a missing or placeholder parent of the root is reported in the match. A parent
+that the sensor reported as unresolved is **not** (next section). Root selection never decides whether a rule matches.
+
+### Unresolved ancestry (requirement for A4)
+**Process identity confidence and ancestry completeness are independent.** The Linux adapter can report an observed
+process with a trustworthy identity (`attributes.identity_resolution="native"`) whose ancestry it could not resolve:
+`attributes.parent_unresolved` is `"sensor_task_walk"` or `"conflicting_sensor_parent"`, and the event has no
+`parent_process_instance_id`. Such a `process_start` matches like any other. Unless an earlier event already gave the
+process a parent, it is its own root, `identity_inferred_event_ids` and `placeholder_process_ids` stay empty, and both
+`root_parent_missing` and `root_parent_is_placeholder` are `False`.
+
+**`root_parent_missing=False` does not prove that the ancestry is complete.** The flag is `True` only when the root
+records a parent id whose node is not in the graph. With no parent id it is `False`, whatever the sensor said about why.
+
+The incident builder (A4, not implemented yet) **MUST**:
+1. inspect the attributes of every bound `HostEvent`, in `EngineMatch.events` and `SuppressedMatch.events`, for
+   `parent_unresolved`;
+2. also inspect the cached `process_start` of each process from the matching one up to the root
+   (`graph.events[graph.get(process_id).start_event_id]`), right after `evaluate` and before the next `apply` or `gc`.
+   Bound events are not enough: when a child matches and the root is an unresolved ancestor, only the ancestor's start
+   carries the reason, and the match does not contain that event;
+3. preserve every reason found as an evidence gap in the incident (the contract's `PARENT_NOT_OBSERVED` code fits, with
+   the reason in its message). It must not silently describe that ancestry as complete or add a parent relationship,
+   and the marker alone does not make the process identity inferred;
+4. not claim complete ancestry when a start event needed for step 2 is not available (`start_event_id` is `None`, or
+   the event is no longer cached). The graph node does not keep the attribute, so the reason may have been lost.
+
+Finding no marker is not proof of completeness either; it only means that no reason was found.
 
 ### Deduplication (best effort, bounded)
 * The engine remembers the ids of the last `max_seen_events` evaluated events, matching or not. Skipped events are not
@@ -444,5 +471,8 @@ began loses that call's results, and a retry may not recover them. Recovery is l
 * Single-threaded.
 * Deduplication and suppression are bounded, in-memory and best effort; neither survives a restart.
 * No incident builder, persistence, transport or response, and no agent loop that connects it to an adapter.
+* No result field reports `parent_unresolved`, and the graph node does not retain it. Once the start event that carried
+  it leaves the event cache, the reason cannot be read from the graph
+  ([unresolved ancestry](#unresolved-ancestry-requirement-for-a4)).
 * A tiny `incident_window_seconds` is accepted but rounded to whole milliseconds: 0.0005 s or less becomes 0 ms, and
   repeats stamped at or after the latest hit are then reported as new matches. The shipped rules use 60 and 120 s.
