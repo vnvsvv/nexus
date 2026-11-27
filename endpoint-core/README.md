@@ -481,32 +481,42 @@ A `kind: sequence` rule detects when every step is bound to its own accepted eve
     observed parent link), `descendant_of` (up to `max_depth` links; `include_self` also accepts the same process).
     Links pass through placeholders but never across a missing node, and PIDs are never used;
   * every bound process is still in the graph.
-* **Which binding.** A depth-first search in step order; per step, the candidate nearest to the anchor's time is tried
-  first, then the latest arrival. The first complete binding wins, so the result is deterministic. At most one
-  detection per rule and event.
+* **One detection per distinct root.** The search enumerates the complete bindings of every anchor position (in
+  step order) and computes each binding's root. The first binding found for a root is that root's **preferred**
+  binding; later, equivalent bindings of the same root are dropped. Each distinct `(rule, root)` is reported once,
+  with its own bindings, evidence, `process_by_step`, placeholder and inferred-identity facts, `matched_at` and
+  response target. Evidence of different roots is never combined. Example (`test_engine_sequence.py`): under nested
+  interpreters `py1 -> py2 -> bash`, one connection gives two matches, `interp = py2` (root `c`) and `interp = py1`
+  (root `b`). Within a rule, results are in discovery order.
+* **Preference, deterministic.** A depth-first search in step order; per step, the candidate nearest to the
+  triggering event's time is tried first, then the latest arrival. In an ordered rule the earliest bound event is
+  step 0's, so the step-0 candidate fixes the root: a candidate whose root is already found is skipped, and once a
+  binding completes the search moves to the next step-0 candidate. An unordered rule has no such shortcut and spends
+  budget on equivalent bindings.
 * **`matched_at` and the trigger.** `matched_at` is the latest bound **event time** (logical completion of the
   sequence); `trigger_event_id` is the event whose `evaluate` call completed it, which is a late, earlier-stamped
   event when delivery is out of order. Order and windows use event time; arrival order only breaks timestamp ties.
-
-> **Not complete coverage: one detection per rule and event.** When an event completes several valid bindings that
-> would select **different roots**, only the preferred binding is reported. The others are neither reported nor
-> counted. Example (`test_engine_sequence.py`): under nested interpreters `py1 -> py2 -> bash`, the engine reports
-> `interp = py2` (root three generations above py2) and drops the equally valid `interp = py1` (another root). Fixing
-> this needs the search to continue past the first binding and report one detection per distinct root, within the
-> same budgets. That is not part of phase 1.
+* **Suppression per root.** Each root found by one evaluation is registered once, independently. One event can be a
+  new `EngineMatch` for one root and a `SuppressedMatch` for another, and a repeat of root A never suppresses root B.
 * **After a match.** Candidates are not consumed. Another completion for the same `(rule, root)` inside the incident
   window is a `SuppressedMatch` with its own complete binding, ready to be added to the incident as evidence (A4).
   Suppression is timed by `matched_at`.
 
-Every way a sequence can be lost is counted (none of them is a plain miss, such as a step that never happened):
+**Coverage is complete only when the search is exhaustive.** Each way a sequence can be lost is counted. A plain miss
+(a step that never happened) is not counted:
 
 | Counter | When |
 |---|---|
 | `sequence_candidates_expired` | a candidate removed at `max_candidates_per_step` that was outside the rule window of the event that caused the removal. Under out-of-order delivery a later event could still have needed it, so this is a weaker loss signal, not proof of harmlessness |
 | `sequence_candidates_evicted` | a candidate removed at the cap while still inside the window (rate-limited warning): a detection may be missed |
-| `sequence_searches_truncated` | a (rule, event) search found nothing after skipping candidates beyond `max_search_candidates` |
-| `sequence_searches_exhausted` | a (rule, event) search stopped at `max_search_nodes` (rate-limited warning) |
-| `sequence_candidates_unavailable` | a (rule, event) search found nothing after skipping in-window candidates whose process left the graph |
+| `sequence_searches_truncated` | a (rule, event) search did not try candidates beyond `max_search_candidates` |
+| `sequence_searches_exhausted` | a (rule, event) search ran out of its shared `max_search_nodes` budget before it ended (rate-limited warning) |
+| `sequence_candidates_unavailable` | a (rule, event) search skipped in-window candidates whose process left the graph |
+
+The three search counters are counted **once per (rule, event)**, whatever the number of anchor positions, and
+**also when roots were found**: the roots already found are reported, and another root may have been missed. A search
+that ends exactly at its budget is complete and not counted. An anchor position where some step has no candidate at
+all cannot bind, so limits on its other steps are not counted.
 
 The cap removes the **oldest** candidate by (timestamp, arrival), which can be the new one itself if it is the oldest.
 That favours recent activity, and a burst of matching events can push out an older candidate that a later event still
@@ -523,15 +533,18 @@ Counts of items, not bytes. Invalid or mutually inconsistent values raise `Value
 | `max_future_skew_seconds` | 300 | live mode future check |
 | `max_candidates_per_step` | 128 | sequence candidates kept per rule step |
 | `max_total_candidate_events` | 50000 | startup capacity check: the per-step caps of all sequence steps must fit in it |
-| `max_search_candidates` | 64 | candidates tried per step and anchor |
-| `max_search_nodes` | 2000 | candidates examined per anchor and step before the search stops |
+| `max_search_candidates` | 64 | candidates tried per step and anchor position |
+| `max_search_nodes` | 2000 | candidates examined per (rule, event), shared by all its anchor positions, before the search stops |
 | `max_values_per_key` | 128 | disables threshold rules whose `min_distinct` is larger |
 | `max_threshold_keys` | 1024 | reserved for threshold rules (validated, shown by `state_bounds()`) |
 | `max_threshold_bindings` | 200 | reserved for threshold rules (validated) |
 
 The work per accepted event is bounded: for each sequence rule it listens to, the search reads each other step's store
-once (at most `max_candidates_per_step` entries), sorts at most that many, and then examines at most `max_search_nodes`
-candidates per anchor step. A full store also scans its entries once to choose what to remove.
+once per anchor position (at most `max_candidates_per_step` entries), sorts at most that many, and examines at most
+`max_search_nodes` candidates for the whole (rule, event). The distinct roots it returns are therefore bounded too,
+because every complete binding costs at least one examined candidate. A full store also scans its entries once to
+choose what to remove. Enumerating all roots costs more than stopping at the first binding: a search that finds a
+root keeps going until it is exhaustive or the budget runs out.
 
 ### Statistics and state
 * `engine.stats()` returns an `EngineStats` snapshot: the counters above plus `events_received`, `seen_evicted`,
@@ -557,9 +570,11 @@ began loses that call's results, and a retry may not recover them. Recovery is l
 * Sequence detection is bounded, and in-memory only: candidate state does not survive a restart, a full step store
   drops its oldest candidate, and a search tries a limited number of candidates. Each such loss is counted (see
   [Sequence rules](#sequence-rules-a3b-phase-1)), but the detection is not recovered.
-* **At most one sequence detection per rule and event.** When several bindings exist, only the preferred one is
-  reported; another binding that would select a different root is lost and **not counted**
-  ([Sequence rules](#sequence-rules-a3b-phase-1)).
+* **Distinct roots are complete only within the search limits.** Every distinct root is reported when the search is
+  exhaustive. When `max_search_nodes`, `max_search_candidates`, a full candidate store or a process gone from the graph
+  stops it, the roots found are reported and the loss is counted, but further roots are not recovered.
+* Unordered rules spend search budget on equivalent same-root bindings (only ordered rules can skip them), so they
+  reach `max_search_nodes` sooner under heavy matching load.
 * A sequence's lineage is judged on the graph when the anchor arrives. A parent link that only appears later is not
   revisited for candidates already passed over, and a bound process must still be in the graph.
 * The root of a sequence is an ancestor of its earliest bound process only. In an unordered rule this need not be an

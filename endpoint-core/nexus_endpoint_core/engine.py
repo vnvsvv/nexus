@@ -78,12 +78,14 @@ Sequence rules (bounded candidates, bounded search)
 
     Search. Every event that satisfies at least one step is also an ANCHOR at that step (any step, not only the last,
     so a sequence completed by a late event is still found). The other steps are bound from their candidate stores by a
-    depth-first search in rule-step order; the first complete binding wins, at most one per rule and event (the anchor's
-    step positions are tried in step order). PHASE 1 LIMITATION: when several bindings are valid and would select
-    different roots, only the preferred one is reported; the others are neither reported nor counted, so an
-    independently valid detection under another root can be lost (test_engine_sequence.py shows a case). Reporting
-    one detection per distinct root would need the search to continue past the first binding, within the same
-    budgets. A binding must satisfy:
+    depth-first search in rule-step order, over every anchor position of the event (in step order), and the search
+    ENUMERATES distinct roots: each complete binding's root is selected as below, the first binding found for a root is
+    that root's preferred binding, and later bindings of the same root are dropped. One detection is reported per
+    distinct ``(rule, root)``, in discovery order, each with its own binding, evidence and facts; evidence of different
+    roots is never combined. In an ordered rule the earliest bound event is step 0's, so the step-0 candidate fixes the
+    root: a candidate whose root is already found is skipped and, once a binding completes, the search moves on to the
+    next step-0 candidate. An unordered rule has no such shortcut and spends budget on equivalent bindings. A binding
+    must satisfy:
     * one event per step: a single event never fills two steps;
     * the window: the span between the earliest and latest bound timestamps is at most ``window_seconds`` (inclusive);
     * order (``ordered: true``): steps follow the listed order by (timestamp, arrival rank), so equal timestamps are
@@ -92,12 +94,16 @@ Sequence rules (bounded candidates, bounded search)
       observed parent link; ``descendant_of`` follows up to ``max_depth`` observed parent links (``include_self`` also
       accepts the same process). Links are followed through placeholders, never across a missing node, and nothing is
       inferred from PIDs;
-    * every bound process is still in the graph. A candidate whose process left it is skipped; if the search then
-      fails, ``sequence_candidates_unavailable`` counts it.
+    * every bound process is still in the graph. A candidate whose process left it is skipped and
+      ``sequence_candidates_unavailable`` counts the (rule, event).
     Per step, candidates are tried nearest to the anchor's time first, then latest arrival; at most
-    ``max_search_candidates`` are tried (a failed search that skipped some counts ``sequence_searches_truncated``),
-    and at most ``max_search_nodes`` candidates are examined per anchor and step (``sequence_searches_exhausted``,
-    with a rate-limited warning). A search that fails only because a step has no candidate is not a loss.
+    ``max_search_candidates`` are tried (``sequence_searches_truncated``). ONE budget of ``max_search_nodes`` examined
+    candidates covers every anchor position of a (rule, event); when it runs out the search stops, the roots already
+    found are reported, and ``sequence_searches_exhausted`` counts it (rate-limited warning). A search that ends exactly
+    at the budget is complete and is not counted. These three counters are counted once per (rule, event), also when
+    roots were found, because another root may have been missed: they mark incomplete coverage, not only a missed
+    detection. A position where some step has no candidate at all cannot bind, so limits on its other steps are not a
+    loss; neither is a plain miss.
 
     Result. ``matched_at`` is the latest bound event's time (the trigger's when events arrive in order); suppression
     is keyed and timed by it. The root is selected from the process of the EARLIEST bound event (docs/02 section 4:
@@ -105,7 +111,9 @@ Sequence rules (bounded candidates, bounded search)
     processes, then placeholders on the lineage paths between bound processes. ``identity_inferred_event_ids`` lists
     bound events whose ``identity_resolution`` is not "native". ``response_target_process_id`` is the process of
     ``response.target_step``. Candidates are not consumed by a match: a later completion for the same root is a
-    ``SuppressedMatch`` carrying its full binding as evidence.
+    ``SuppressedMatch`` carrying its full binding as evidence. Suppression is per ``(rule, root)``: each root found by
+    one evaluation is registered once, independently, so one event may yield a new match for one root and a repeat for
+    another, and a repeat of root A never suppresses root B.
 
 Root selection (never decides whether a rule matches)
     From the process of the matching event (for a sequence, of its earliest bound event), follow the OBSERVED
@@ -318,11 +326,11 @@ class EngineStats:
     sequence_candidates_expired: int = 0      # dropped at max_candidates_per_step, outside the window of the event that
     #                                           caused the drop (a later, out-of-order event might still have needed it)
     sequence_candidates_evicted: int = 0      # dropped at max_candidates_per_step while inside that window: likely loss
-    sequence_searches_truncated: int = 0      # (rule, event) searches that failed after skipping candidates past
-    #                                           max_search_candidates: a binding among those may have been missed
-    sequence_searches_exhausted: int = 0      # (rule, event) searches that stopped at max_search_nodes without a binding
-    sequence_candidates_unavailable: int = 0  # (rule, event) searches that failed after skipping in-window candidates
-    #                                           whose process has left the graph (evicted or removed by gc)
+    # The next three count (rule, event) evaluations whose search may be INCOMPLETE, once each whatever the number of
+    # anchor positions, and also when some roots were found: another root may have been missed.
+    sequence_searches_truncated: int = 0      # candidates past max_search_candidates were not tried
+    sequence_searches_exhausted: int = 0      # the shared max_search_nodes budget ran out before the search ended
+    sequence_candidates_unavailable: int = 0  # in-window candidates were skipped because their process left the graph
     rules_enabled: int = 0
     rules_disabled: int = 0
     rules_rejected_at_load: int = 0
@@ -844,19 +852,12 @@ class RuleEngine:
                 continue
             window_ms = self._sequence_window_ms[rule.id]
             inserts += [((rule.id, i), anchor, window_ms) for i in satisfied]
-            found, missed = None, set()
-            for i in satisfied:                                         # first step position that completes, in order
-                found, why = self._search_sequence(graph, rule, i, anchor)
-                missed |= why
-                if found is not None:
-                    break
-            if found is None:
-                losses += sorted(missed)
-                continue
-            fresh, repeat, latest_ms = self._sequence_results(graph, rule, found, event.event_id)
-            prepared.append((rule.id, (rule.id, fresh.root_process_instance_id), latest_ms, self._window_ms[rule.id],
-                             fresh, repeat))
-        prepared.sort(key=lambda item: item[0])                         # results in rule-id order (stable)
+            roots, missed = self._enumerate_sequence(graph, rule, satisfied, anchor)
+            losses += sorted(missed)                                    # also when some roots were found
+            for binding, root in roots:                                 # one per distinct root, in discovery order
+                fresh, repeat, latest_ms = self._sequence_results(graph, rule, binding, root, event.event_id)
+                prepared.append((rule.id, (rule.id, root.process_id), latest_ms, self._window_ms[rule.id], fresh, repeat))
+        prepared.sort(key=lambda item: item[0])                         # rule-id order; stable within a rule
 
         # Phase 2 - commit. Only dictionary and counter bookkeeping on values prepared above; no predicate, graph,
         # object construction or logging runs here (warnings are returned and logged after the event is recorded). It is
@@ -865,8 +866,9 @@ class RuleEngine:
         for name in losses:
             self._counters[name] += 1
             if name == "sequence_searches_exhausted" and (self._counters[name] == 1 or self._counters[name] % _WARN_EVERY == 0):
-                warnings.append(("sequence search stopped at max_search_nodes (%d) without a binding (%d so far); a "
-                                 "detection may have been missed", (self.limits.max_search_nodes, self._counters[name])))
+                warnings.append(("sequence search stopped at max_search_nodes (%d) before it ended (%d so far); a "
+                                 "detection, or another root, may have been missed",
+                                 (self.limits.max_search_nodes, self._counters[name])))
         for store_key, candidate, window_ms in inserts:
             evicted_so_far = self._store_candidate(store_key, candidate, window_ms)
             if evicted_so_far is not None:
@@ -888,17 +890,16 @@ class RuleEngine:
         return matches, suppressed, warnings
 
     # -- sequence rules ----------------------------------------------------------------------------
-    def _search_sequence(self, graph: ProcessGraph, rule: Rule, anchor_index: int, anchor: _Candidate
-                         ) -> tuple[dict[int, _Candidate] | None, set[str]]:
-        """Bind every step of ``rule`` with ``anchor`` fixed at ``anchor_index``; never mutates the engine.
-
-        Returns ``(binding, missed)``: the binding (step index -> candidate) or None, and the coverage-loss counter
-        names that apply when no binding was found. Only reads the candidate stores and the graph.
-        """
+    def _candidate_pools(self, graph: ProcessGraph, rule: Rule, anchor_index: int, anchor: _Candidate
+                         ) -> tuple[dict[int, list[_Candidate]] | None, set[str]]:
+        """The candidates each other step may take with ``anchor`` at ``anchor_index``, best first, and the
+        coverage-loss names that apply. None when some step has no candidate at all: then no binding exists at this
+        anchor position, so limits on the other steps cost nothing (only a candidate skipped because its process left
+        the graph can explain that empty step)."""
         window = self._sequence_window_ms[rule.id]
         ordered = bool(rule.ordered)
         limit = self.limits.max_search_candidates
-        truncated = unavailable = False
+        missed: set[str] = set()
         pools: dict[int, list[_Candidate]] = {}
         for i in range(len(rule.steps)):
             if i == anchor_index:
@@ -913,18 +914,63 @@ class RuleEngine:
                     skipped = True
                     continue
                 pool.append(candidate)
-            if not pool:                         # this step cannot be bound: other steps' limits did not matter
+            if not pool:
                 return None, {"sequence_candidates_unavailable"} if skipped else set()
-            unavailable |= skipped
+            if skipped:
+                missed.add("sequence_candidates_unavailable")
             pool.sort(key=lambda c: (abs(c.t_ms - anchor.t_ms), -c.rank))     # nearest in time, then latest arrival
             if len(pool) > limit:
-                truncated = True
+                missed.add("sequence_searches_truncated")
                 del pool[limit:]
             pools[i] = pool
+        return pools, missed
 
+    def _enumerate_sequence(self, graph: ProcessGraph, rule: Rule, anchor_indexes: list[int], anchor: _Candidate
+                            ) -> tuple[list[tuple[dict[int, _Candidate], _Root]], set[str]]:
+        """Every distinct root ``rule`` detects with ``anchor``, each with its preferred binding; never mutates.
+
+        Anchor positions are tried in step order and, per step, candidates best first (``_candidate_pools``), so the
+        first complete binding found for a root is its preferred one; later bindings for the same root are dropped. One
+        ``max_search_nodes`` budget covers every anchor position of this (rule, event). Returns ``(roots, missed)``:
+        ``(binding, root)`` pairs in discovery order, and the coverage-loss counter names that apply even when some
+        roots were found (budget exhausted, candidates truncated, candidates whose process left the graph).
+
+        In an ordered rule the earliest bound event is always step 0's, so its candidate fixes the root: a step-0
+        candidate whose root is already found is skipped, and the first completion below it ends that subtree. An
+        unordered rule has no such shortcut; equivalent bindings are deduplicated when they complete.
+        """
+        ordered = bool(rule.ordered)
+        roots: dict[str, tuple[dict[int, _Candidate], _Root]] = {}
+        missed: set[str] = set()
+        budget = [self.limits.max_search_nodes]
+
+        def root_of(candidate: _Candidate) -> _Root:
+            return _select_root(graph, graph.get(candidate.event.process_instance_id), rule.context.max_ancestors,
+                                self.root_stop_binaries)
+
+        try:
+            for anchor_index in anchor_indexes:
+                if ordered and anchor_index == 0 and root_of(anchor).process_id in roots:
+                    continue                     # this position can only find a root already found
+                pools, why = self._candidate_pools(graph, rule, anchor_index, anchor)
+                missed |= why
+                if pools is not None:
+                    self._bind_sequence(graph, rule, anchor_index, anchor, pools, roots, budget, root_of)
+        except _SearchExhausted:
+            missed.add("sequence_searches_exhausted")
+        return list(roots.values()), missed
+
+    def _bind_sequence(self, graph: ProcessGraph, rule: Rule, anchor_index: int, anchor: _Candidate,
+                       pools: Mapping[int, list[_Candidate]], roots: dict[str, tuple[dict[int, _Candidate], _Root]],
+                       budget: list[int], root_of: Callable[[_Candidate], _Root]) -> None:
+        """Depth-first search over ``pools`` in rule-step order, recording the first binding of each new root.
+        Each candidate examined costs one unit of ``budget``; ``_SearchExhausted`` is raised only when another
+        candidate would have to be examined after it reached zero, so a search that ends exactly at the budget is
+        complete."""
+        window = self._sequence_window_ms[rule.id]
+        ordered = bool(rule.ordered)
         order = [i for i in range(len(rule.steps)) if i != anchor_index]
         assigned: dict[int, _Candidate] = {anchor_index: anchor}
-        budget = [self.limits.max_search_nodes]
 
         def fits(i: int, candidate: _Candidate) -> bool:
             if any(other.event.event_id == candidate.event.event_id for other in assigned.values()):
@@ -947,43 +993,39 @@ class RuleEngine:
             return True
 
         def bind(position: int) -> bool:
+            """True once a complete binding was reached below; in an ordered rule that settles the root of the step-0
+            candidate (or of the anchor at step 0), so the levels below step 0 stop exploring."""
             if position == len(order):
+                binding = dict(assigned)
+                root = root_of(min(binding.values(), key=lambda c: c.key))     # the earliest bound event's process
+                roots.setdefault(root.process_id, (binding, root))            # the first, preferred, binding wins
                 return True
             i = order[position]
             for candidate in pools[i]:
                 if budget[0] <= 0:
                     raise _SearchExhausted
                 budget[0] -= 1
-                if fits(i, candidate):
-                    assigned[i] = candidate
-                    if bind(position + 1):
-                        return True
-                    del assigned[i]
+                if not fits(i, candidate):
+                    continue
+                if ordered and i == 0 and root_of(candidate).process_id in roots:
+                    continue                     # every binding below would give a root already found
+                assigned[i] = candidate
+                complete = bind(position + 1)
+                del assigned[i]
+                if complete and ordered and i != 0:
+                    return True                  # the root is fixed above this level
             return False
 
-        try:                                     # each lineage edge is checked when its second end is bound
-            if bind(0):
-                return dict(assigned), set()
-            missed: set[str] = set()
-        except _SearchExhausted:
-            missed = {"sequence_searches_exhausted"}
-        if truncated:
-            missed.add("sequence_searches_truncated")
-        if unavailable:
-            missed.add("sequence_candidates_unavailable")
-        return None, missed
+        bind(0)                                  # each lineage edge is checked when its second end is bound
 
-    def _sequence_results(self, graph: ProcessGraph, rule: Rule, found: Mapping[int, _Candidate], trigger_id: str
-                          ) -> tuple[EngineMatch, SuppressedMatch, int]:
-        """Build both possible results of a complete binding, and return the latest bound event time in ms."""
+    def _sequence_results(self, graph: ProcessGraph, rule: Rule, found: Mapping[int, _Candidate], root: _Root,
+                          trigger_id: str) -> tuple[EngineMatch, SuppressedMatch, int]:
+        """Build both possible results of one root's binding, and return its latest bound event time in ms."""
         steps = rule.steps
         bound = {steps[i].name: found[i].event for i in range(len(steps))}
         bindings = {name: event.event_id for name, event in bound.items()}
         process_by_step = {name: event.process_instance_id for name, event in bound.items()}
-        earliest = min(found.values(), key=lambda c: c.key)
         latest = max(found.values(), key=lambda c: c.key)
-        root = _select_root(graph, graph.get(earliest.event.process_instance_id), rule.context.max_ancestors,
-                            self.root_stop_binaries)
         placeholders: list[str] = []
         for i in range(len(steps)):                                     # placeholder bound processes, in step order
             pid = found[i].event.process_instance_id

@@ -338,23 +338,184 @@ def nested_interpreters(second_is_interpreter: bool = True) -> list[HostEvent]:
     return chain
 
 
-def test_two_valid_bindings_with_different_roots_report_only_the_preferred_one(shipped):
-    # Phase 1 policy: at most one detection per rule and event. The alternative binding (interp = py1, root b) is
-    # valid on its own (next test) but is not reported, and no counter records it: this is a documented limitation.
+def roots_of(matches: list[EngineMatch] | list[SuppressedMatch]) -> list[str]:
+    return [m.root_process_instance_id.split(":", 1)[1] for m in matches]
+
+
+def test_two_valid_bindings_with_different_roots_are_both_reported(shipped):
+    # Before the fix only root c was reported and the equally valid root b was dropped without a counter.
+    events = nested_interpreters()
     engine, graph = engine_for(shipped, LIN)
-    results = feed(engine, graph, *nested_interpreters())
-    (match,) = found(results, "NX-LIN-001")
-    assert match.process_by_step["interp"] == f"{LIN}:py2"                     # nearest in time to the trigger
-    assert match.root_process_instance_id == f"{LIN}:c"                        # 3 generations above py2
-    assert repeats(results, "NX-LIN-001") == [] and engine.stats().matches_emitted == 1
-    assert list(engine._suppression) == [("NX-LIN-001", f"{LIN}:c")]           # nothing for root b
-    assert counters(engine) == dict.fromkeys(SEQUENCE_COUNTERS, 0)             # not counted as a coverage loss
+    results = feed(engine, graph, *events)
+    by_id = {e.event_id: e for e in events}
+    assert [len(r.matches) for r in results[:-1]] == [0] * (len(events) - 1)
+    c, b = results[-1].matches                                                  # both from the one connection event
+    assert roots_of([c, b]) == ["c", "b"]                                       # discovery order: py2 is nearer
+    shared = {k: by_id[c.bindings[k]] for k in ("shell", "read", "net")}
+    for match, interp in ((c, "py2"), (b, "py1")):
+        assert match.process_by_step == {"interp": f"{LIN}:{interp}", "shell": f"{LIN}:bash", "read": f"{LIN}:cat",
+                                         "net": f"{LIN}:curl"}
+        assert match.events["interp"].process_instance_id == f"{LIN}:{interp}"        # its own interpreter evidence
+        assert {k: match.events[k] for k in ("shell", "read", "net")} == shared
+        assert match.trigger_event_id == events[-1].event_id and match.matched_at == c.matched_at
+        assert match.placeholder_process_ids == () and match.identity_inferred_event_ids == ()
+        assert match.response_target_process_id is None
+        assert match.to_contract().bindings == dict(match.bindings)
+    assert list(engine._suppression) == [("NX-LIN-001", f"{LIN}:c"), ("NX-LIN-001", f"{LIN}:b")]
+    assert engine.stats().matches_emitted == 2
+    assert counters(engine) == dict.fromkeys(SEQUENCE_COUNTERS, 0)             # the enumeration was exhaustive
 
 
-def test_the_unreported_alternative_is_a_valid_detection_on_its_own(shipped):
+def test_distinct_root_enumeration_is_deterministic(shipped):
+    outcomes = []
+    for _ in range(3):
+        engine, graph = engine_for(shipped, LIN)
+        results = feed(engine, graph, *nested_interpreters())
+        outcomes.append([(m.root_process_instance_id, dict(m.process_by_step)) for m in found(results, "NX-LIN-001")])
+    assert outcomes[0] == outcomes[1] == outcomes[2] and len(outcomes[0]) == 2
+
+
+def test_the_second_root_is_the_one_found_when_it_is_the_only_binding(shipped):
     engine, graph = engine_for(shipped, LIN)
     (match,) = found(feed(engine, graph, *nested_interpreters(second_is_interpreter=False)), "NX-LIN-001")
     assert match.process_by_step["interp"] == f"{LIN}:py1" and match.root_process_instance_id == f"{LIN}:b"
+
+
+def test_equivalent_bindings_of_one_root_give_one_match_in_an_ordered_rule(shipped):
+    engine, graph = engine_for(shipped, LIN)
+    story = l1()
+    extra = lin("file_access", "cat", 2.5, parent="bash", binary=CAT)       # a second valid read: same root
+    results = feed(engine, graph, *[story[k] for k in ("interp", "shell", "cat", "read")], extra, story["curl"], story["net"])
+    (match,) = found(results, "NX-LIN-001")
+    assert match.bindings["read"] == extra.event_id                         # the preferred (nearest) binding
+    assert list(engine._suppression) == [("NX-LIN-001", f"{LIN}:py")] and engine.stats().matches_emitted == 1
+
+
+def test_equivalent_bindings_of_one_root_give_one_match_in_an_unordered_rule(shipped, tmp_path):
+    rule = variant("NX-LIN-001", lambda d: d.__setitem__("ordered", False), tmp_path)
+    engine, graph = engine_for([rule], LIN)
+    story = l1()
+    extra = lin("file_access", "cat", 2.5, parent="bash", binary=CAT)
+    results = feed(engine, graph, *[story[k] for k in ("interp", "shell", "cat", "read")], extra, story["curl"], story["net"])
+    (match,) = found(results, "NX-LIN-001")
+    assert match.bindings["read"] == extra.event_id and engine.stats().matches_emitted == 1
+    assert engine.stats().matches_suppressed == 0                           # one registration per root and event
+
+
+def test_each_root_keeps_its_own_suppression_window(shipped):
+    events = nested_interpreters()
+    retimed = {"py1": 0, "py2": 5, "bash": 6, "cat": 7, "curl": 8}         # net at 9: both interpreters in the window
+    chain = []
+    for e in events:
+        name = e.process_instance_id.split(":", 1)[1]
+        if e.event_type == "process_start" and name in retimed:
+            e = e.model_copy(update={"timestamp_utc": stamp(retimed[name])})
+        elif e.event_type == "file_access":
+            e = e.model_copy(update={"timestamp_utc": stamp(7.1)})
+        elif e.event_type == "network_connect":
+            e = e.model_copy(update={"timestamp_utc": stamp(9)})
+        chain.append(e)
+    engine, graph = engine_for(shipped, LIN)
+    first = feed(engine, graph, *chain)[-1]
+    assert roots_of(list(first.matches)) == ["c", "b"] and first.suppressed == ()   # neither suppresses the other
+    both = feed(engine, graph, lin("network_connect", "curl", 30, parent="bash", binary=CURL))[0]
+    assert both.matches == () and roots_of(list(both.suppressed)) == ["c", "b"]     # both repeat, each once
+    b_entry = engine._suppression[("NX-LIN-001", f"{LIN}:b")]
+    only_c = feed(engine, graph, lin("network_connect", "curl", 62, parent="bash", binary=CURL))[0]
+    assert only_c.matches == () and roots_of(list(only_c.suppressed)) == ["c"]       # py1 (t=0) left the window
+    assert engine._suppression[("NX-LIN-001", f"{LIN}:b")] == b_entry                # root b's window is untouched
+    t62 = engine_module._to_ms(NOW) + 62_000
+    assert engine._suppression[("NX-LIN-001", f"{LIN}:c")] == (t62, t62 + 120_000)
+
+
+def test_one_event_can_be_new_for_one_root_and_a_repeat_for_another(shipped):
+    events = nested_interpreters()
+    py1_start = next(e for e in events if e.process_instance_id == f"{LIN}:py1" and e.event_type == "process_start")
+    rest = [e for e in events if e is not py1_start]
+    engine, graph = engine_for(shipped, LIN)
+    first = feed(engine, graph, *rest)[-1]                                  # py1's start has not arrived: placeholder
+    assert roots_of(list(first.matches)) == ["py2"]                         # the climb stops below the placeholder
+    late = feed(engine, graph, py1_start)[0]                                # the late start completes interp = py1
+    assert roots_of(list(late.matches)) == ["b"] and late.suppressed == ()
+    again = feed(engine, graph, lin("network_connect", "curl", 10, parent="bash", binary=CURL))[0]
+    assert roots_of(list(again.matches)) == ["c"]                           # py1 is observed now: py2's root is c
+    assert roots_of(list(again.suppressed)) == ["b"]                        # b is still in its window
+
+
+def net_evaluation(shipped: RuleSet, **limits: int) -> tuple[list[str], dict[str, int]]:
+    """Feed the nested-interpreter chain and return the roots and counter changes of the final connection event."""
+    engine, graph = engine_for(shipped, LIN, limits=EngineLimits(**limits))
+    events = nested_interpreters()
+    feed(engine, graph, *events[:-1])
+    before = counters(engine)
+    (result,) = feed(engine, graph, events[-1])
+    after = counters(engine)
+    return roots_of(found([result], "NX-LIN-001")), {k: after[k] - before[k] for k in after}
+
+
+def test_a_partial_search_returns_what_it_found_and_reports_incomplete_coverage(shipped):
+    # The connection's search examines interp py2, shell, read (root c), then interp py1, shell, read (root b): 6.
+    outcomes = {n: net_evaluation(shipped, max_search_nodes=n) for n in range(1, 12)}
+    complete = min(n for n, (_, delta) in outcomes.items() if delta["sequence_searches_exhausted"] == 0)
+    first_root = min(n for n, (roots, _) in outcomes.items() if roots)
+    assert (first_root, complete) == (3, 6)
+    for n in range(first_root, complete):                                   # one root found, the budget ran out
+        roots, delta = outcomes[n]
+        assert roots == ["c"] and delta["sequence_searches_exhausted"] == 1
+    roots, delta = outcomes[complete]                                       # ends exactly at its budget: not counted
+    assert roots == ["c", "b"] and delta == dict.fromkeys(SEQUENCE_COUNTERS, 0)
+    assert outcomes[complete] == net_evaluation(shipped, max_search_nodes=complete)  # deterministic
+
+
+def test_one_budget_covers_every_anchor_position(shipped, tmp_path):
+    # An unordered variant with two network steps: the second connection is an anchor at both positions. Each
+    # position examines 4 candidates (interp, shell, read, the other connection), so the evaluation needs 8 in all;
+    # with a fresh budget per position, 4 would have been enough.
+    def mutate(d: dict) -> None:
+        d["ordered"] = False
+        d["steps"].append({**d["steps"][3], "step": "net2"})
+    rule = variant("NX-LIN-001", mutate, tmp_path)
+
+    def last_event(budget: int) -> tuple[int, int]:
+        engine, graph = engine_for([rule], LIN, limits=EngineLimits(max_search_nodes=budget))
+        feed(engine, graph, *l1().values())
+        before = counters(engine)["sequence_searches_exhausted"]
+        (result,) = feed(engine, graph, lin("network_connect", "curl", 5, parent="bash", binary=CURL))
+        return len(result.matches), counters(engine)["sequence_searches_exhausted"] - before
+
+    assert last_event(8) == (1, 0)              # the whole evaluation fits exactly: not exhausted
+    assert last_event(7) == (1, 1)              # the root was found at the first position, the second ran out: once
+    assert last_event(4) == (1, 1)
+    assert last_event(3) == (0, 1)
+
+
+def test_truncation_is_reported_even_when_another_root_matched(shipped):
+    narrow = net_evaluation(shipped, max_search_candidates=1, max_candidates_per_step=4, max_total_candidate_events=100)
+    assert narrow == (["c"], {**dict.fromkeys(SEQUENCE_COUNTERS, 0), "sequence_searches_truncated": 1})
+    wide = net_evaluation(shipped, max_search_candidates=2, max_candidates_per_step=4, max_total_candidate_events=100)
+    assert wide == (["c", "b"], dict.fromkeys(SEQUENCE_COUNTERS, 0))
+
+
+def test_a_failure_while_building_the_second_root_leaves_no_state(shipped, monkeypatch):
+    events = nested_interpreters()
+    engine, graph = engine_for(shipped, LIN)
+    feed(engine, graph, *events[:-1])
+    before = snapshot(engine)
+    real, calls = engine_module.EngineMatch, []
+
+    def second_fails(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("defect while building root b")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "EngineMatch", second_fails)
+    graph.apply(events[-1])
+    with pytest.raises(RuntimeError):
+        engine.evaluate(graph, events[-1])
+    assert snapshot(engine)[:3] == before[:3]                                 # no candidate, suppression or seen change
+    monkeypatch.setattr(engine_module, "EngineMatch", real)
+    assert roots_of(list(engine.evaluate(graph, events[-1]).matches)) == ["c", "b"]
 
 
 def test_the_trigger_is_always_one_of_the_bindings(shipped):
