@@ -114,6 +114,15 @@ hashable.
   event reports `process_start_time_utc`. A real start later upgrades it in place and keeps children, events and every
   field the start does not repeat. An adapter can seed a placeholder with `attributes.placeholder=true` or
   `attributes.identity_resolution="placeholder"` on a `process_start`.
+* **Unresolved ancestry.** `ProcessNode.parent_unresolved` (`str | None`) keeps the first non-empty string that any
+  applied event of the process carried in `attributes.parent_unresolved`: a start (also a repeated one that is not
+  cached), a file, network or DNS event, or an exit. A later different reason, an event without one, a placeholder
+  upgrade or a parent established later never changes or clears it. It is **history, not the current relationship**:
+  it is separate from `parent_process_instance_id`, links nothing, creates no placeholder and leaves
+  `identity_resolution` and `placeholder` alone. It is runtime-only (not in any contract) and holds no event id. It
+  survives event-cache eviction, but not node removal (`gc`) or a restart. The exit of a process never seen, and a
+  duplicate `event_id` still in the cache, record nothing. See
+  [unresolved ancestry](#unresolved-ancestry-requirement-for-a4) for what A4 must do with it.
 * **Exits and PID reuse.** `end_time_utc` comes only from an observed exit. If a newer start takes over a PID whose
   holder never exited, the old node gets `superseded_by` / `superseded_at_utc` and stays `end_time_utc=None`;
   an older start arriving late never takes the PID. `node.is_live` (false for exited and superseded) is required
@@ -392,20 +401,33 @@ process a parent, it is its own root, `identity_inferred_event_ids` and `placeho
 **`root_parent_missing=False` does not prove that the ancestry is complete.** The flag is `True` only when the root
 records a parent id whose node is not in the graph. With no parent id it is `False`, whatever the sensor said about why.
 
-The incident builder (A4, not implemented yet) **MUST**:
-1. inspect the attributes of every bound `HostEvent`, in `EngineMatch.events` and `SuppressedMatch.events`, for
-   `parent_unresolved`;
-2. also inspect the cached `process_start` of each process from the matching one up to the root
-   (`graph.events[graph.get(process_id).start_event_id]`), right after `evaluate` and before the next `apply` or `gc`.
-   Bound events are not enough: when a child matches and the root is an unresolved ancestor, only the ancestor's start
-   carries the reason, and the match does not contain that event;
-3. preserve every reason found as an evidence gap in the incident (the contract's `PARENT_NOT_OBSERVED` code fits, with
-   the reason in its message). It must not silently describe that ancestry as complete or add a parent relationship,
-   and the marker alone does not make the process identity inferred;
-4. not claim complete ancestry when a start event needed for step 2 is not available (`start_event_id` is `None`, or
-   the event is no longer cached). The graph node does not keep the attribute, so the reason may have been lost.
+The graph keeps the first reason of each process on its node, `ProcessNode.parent_unresolved` (see
+[Process graph](#process-graph-nexus_endpoint_coregraph)), so it outlives the event that carried it. The engine's
+results do not report it. The incident builder (A4, not implemented yet) **MUST**:
+1. read `graph.get(process_id).parent_unresolved` for every process on the path from the matching one up to the root,
+   right after `evaluate` and before the next `apply` or `gc`. Bound events are not enough: when a child matches and
+   the root is an unresolved ancestor, no event in the match carries the reason;
+2. also inspect the attributes of every bound `HostEvent`, in `EngineMatch.events` and `SuppressedMatch.events`. The
+   node keeps only the first reason, and these events are evidence A4 actually holds;
+3. read the field as **historical sensor uncertainty**. For each process that has a reason, judge the current
+   relationship separately, from the node's `parent_process_instance_id` and the parent node:
 
-Finding no marker is not proof of completeness either; it only means that no reason was found.
+   | The process's current parent | What A4 reports |
+   |---|---|
+   | no `parent_process_instance_id` | the parent is currently missing: an evidence gap (the contract's `PARENT_NOT_OBSERVED` code fits), with the reason in its message |
+   | a parent id whose node is gone, or is a placeholder | the parent is still not observed: the same gap |
+   | a parent node that is present and not a placeholder | the relationship was established and stands on its own evidence. Do not report that parent as missing; keep the reason as a historical note (the `OTHER` code fits) |
+
+   The field does not say whether the reason was reported before or after the parent link;
+4. never add or remove a parent relationship because of the reason, or treat the process identity as inferred because
+   of it;
+5. not invent an `evidence_event_id`. The node records no event id, and the original event may have been evicted. Cite
+   an event only if A4 holds the `HostEvent` that carries the reason (bound, or still cached); otherwise report the
+   reason without one. A retained reason is diagnostic metadata, not durable source evidence.
+
+**No reason is not proof of completeness.** It only means that none was found: the metadata lives in memory, so
+removing a node (`gc`, `max_nodes`) or restarting loses it until persistence (A5) is implemented. A node created
+again under the same id starts without it.
 
 ### Deduplication (best effort, bounded)
 * The engine remembers the ids of the last `max_seen_events` evaluated events, matching or not. Skipped events are not
@@ -471,8 +493,8 @@ began loses that call's results, and a retry may not recover them. Recovery is l
 * Single-threaded.
 * Deduplication and suppression are bounded, in-memory and best effort; neither survives a restart.
 * No incident builder, persistence, transport or response, and no agent loop that connects it to an adapter.
-* No result field reports `parent_unresolved`, and the graph node does not retain it. Once the start event that carried
-  it leaves the event cache, the reason cannot be read from the graph
+* No result field reports `parent_unresolved`; it is read from the graph node, which holds only the first reason, no
+  event id, and loses it when the node is removed or on restart
   ([unresolved ancestry](#unresolved-ancestry-requirement-for-a4)).
 * A tiny `incident_window_seconds` is accepted but rounded to whole milliseconds: 0.0005 s or less becomes 0 ms, and
   repeats stamped at or after the latest hit are then reported as new matches. The shipped rules use 60 and 120 s.
