@@ -8,9 +8,9 @@ function Layout() {
   return <><header><b>NEXUS</b><span>Incident workspace</span></header><main><Outlet/></main></>;
 }
 
-function ErrorView() {
+function ErrorView({ detail = false }: { detail?: boolean }) {
   const error = useRouteError();
-  return <section><h1>{isRouteErrorResponse(error) && error.status === 404 ? "Incident not found" : "Unable to load incidents"}</h1>
+  return <section><h1>{detail && isRouteErrorResponse(error) && error.status === 404 ? "Incident not found" : "Unable to load incidents"}</h1>
     <p>Check the incident address and the API connection.</p><Link to="/incidents">Incident list</Link> · <button onClick={() => location.reload()}>Retry</button></section>;
 }
 
@@ -43,7 +43,6 @@ function Detail() {
 const router = createBrowserRouter([{path:"/",element:<Layout/>,children:[
   {index:true,element:<Navigate replace to="/incidents"/>},
   {path:"incidents",loader:({request}) => listIncidents(request.signal),element:<List/>,errorElement:<ErrorView/>},
-  {path:"incidents/:id",loader:({params,request}) => getIncident(params.id!,request.signal),element:<Detail/>,errorElement:<ErrorView/>},
+  {path:"incidents/:id",loader:({params,request}) => getIncident(params.id!,request.signal),element:<Detail/>,errorElement:<ErrorView detail/>},
 ]}]);
 createRoot(document.getElementById("root")!).render(<React.StrictMode><RouterProvider router={router} fallbackElement={<p>Loading incidents…</p>}/></React.StrictMode>);
-

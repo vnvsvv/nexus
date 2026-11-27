@@ -1,10 +1,23 @@
 # NEXUS incident dashboard
 
-Start the fixture API from the repository root with the Python tools environment: `python tools/mock_server.py --port 8000 --token devtoken`.
+## Local fixture
 
-From this directory run `npm ci` and `npm run dev`, then open the printed localhost address. Select the fixture incident to inspect its timeline, gateway evidence, gaps, and full record. Use the Incidents link or browser Back to return.
+From the repository root, start the mock API in the Python tools environment. The mock CLI listens on all interfaces, so use a local development machine with appropriate network restrictions.
 
-Vite proxies /api to the local mock. For an approved lab API, configure VITE_API_BASE and VITE_API_TOKEN for the development session. Browser environment variables are visible to the operator.
+    python tools/mock_server.py --port 8000 --token devtoken
 
-Run `npm run gen:types` after contract changes, `npm run typecheck` for strict checks, and `npm run build` for production output. A deployed SPA needs route fallback to index.html and an API proxy or a configured API base.
+In a second PowerShell terminal, from dashboard/, run:
 
+    $env:NEXUS_MOCK_TOKEN = "devtoken"
+    npm ci
+    npm run dev
+
+Open the printed loopback address and select the fixture incident. The browser requests the incident list and detail from the same origin. The Vite development proxy attaches the explicitly configured mock token to GET requests to the local fixture API. An unset token produces an unauthenticated request. Use only the disposable mock credential here.
+
+## Lab deployment proposal for Rakan
+
+Serve the dashboard and /api/v1 on one HTTPS origin. The gateway should authenticate each analyst, issue a Secure, HttpOnly, SameSite session cookie, and authorize incident reads for that analyst. Keep any upstream service credential on the gateway. Rakan and Bashar should agree on session issuance, expiry and authorization before connecting the SPA to the lab. The standalone static build expects a same-origin API and history fallback for UI routes.
+
+## Checks
+
+Run npm run gen:types after contract changes. npm run typecheck runs strict TypeScript checks. npm run build checks types and builds the production assets.
