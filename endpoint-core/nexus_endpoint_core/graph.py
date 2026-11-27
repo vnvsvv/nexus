@@ -20,6 +20,15 @@ Liveness (never invents an exit)
     process (executable path, and start time where available) before it terminates anything.
     ``dead_since`` is the time retention counts from.
 
+Unresolved ancestry (history, not the current relationship)
+    A sensor can report that it could not resolve a process's parent (``attributes.parent_unresolved``, a string).
+    ``ProcessNode.parent_unresolved`` keeps the FIRST non-empty string seen on any applied event of that process
+    (start, repeated start, file, network, DNS or exit), so it outlives the event that carried it. A later event never
+    changes or clears it, even one that establishes a parent. It is separate from ``parent_process_instance_id``: it
+    links no parent, creates no placeholder and does not change ``identity_resolution`` or ``placeholder``. It records
+    no event id. It is held only on the node: removing the node, or a restart, loses it. A duplicate ``event_id``
+    still in the cache and the exit of a process never seen record nothing.
+
 Bounds and garbage collection (nothing grows without limit)
     * ``max_events``: strict cap on the event cache (FIFO eviction). Evicting an event also removes the
       reference to it from its node, so node references and the cache never disagree.
@@ -124,6 +133,7 @@ class ProcessNode:
     dns_events: list[str] = field(default_factory=list, repr=False)
     rule_hits: list[str] = field(default_factory=list, repr=False)
     order: int = field(default=0, repr=False)   # runtime-only arrival rank (never part of HostEvent/Incident); tie-breaker
+    parent_unresolved: str | None = None        # first sensor-reported reason; history, not the current parent link
 
     @property
     def sort_time(self) -> datetime:
@@ -144,6 +154,13 @@ class ProcessNode:
 def _wants_placeholder(ev: HostEvent) -> bool:
     a = ev.attributes
     return a.get("placeholder") is True or a.get("identity_resolution") == PLACEHOLDER
+
+
+def _note_unresolved(node: ProcessNode, ev: HostEvent) -> None:
+    """Remember the first non-empty ``parent_unresolved`` reason of this process. Never touches the parent link."""
+    reason = ev.attributes.get("parent_unresolved")
+    if node.parent_unresolved is None and isinstance(reason, str) and reason:
+        node.parent_unresolved = reason
 
 
 def _keep(new, old):
@@ -305,6 +322,7 @@ class ProcessGraph:
             if node is None:
                 log.debug("ignoring process_exit for unknown process %s", ev.process_instance_id)
                 return None
+            _note_unresolved(node, ev)
             if node.end_time_utc is None:            # a duplicate exit keeps the first observation
                 node.end_time_utc = ts
                 node.exit_event_id = ev.event_id
@@ -313,13 +331,16 @@ class ProcessGraph:
             return node
 
         if ev.event_type == "process_start":
-            return self._apply_start(ev, ts, started)
+            node = self._apply_start(ev, ts, started)       # new, repeated, or a placeholder upgraded in place
+            _note_unresolved(node, ev)
+            return node
 
         node = self.nodes.get(ev.process_instance_id)
         if node is None:
             node = self._create_from_event(ev, ts, started, placeholder=True)
         else:
             self._fill_missing(node, ev, started)
+        _note_unresolved(node, ev)
         if ev.parent_process_instance_id and node.parent_process_instance_id is None:
             self._link_parent(node, ev.parent_process_instance_id, ev.ppid, ts, replace=False)
         refs: list[str] = getattr(node, _REF_LIST[ev.event_type])
