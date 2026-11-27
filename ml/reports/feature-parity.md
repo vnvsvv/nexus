@@ -19,3 +19,9 @@ Across the first 1,000 rows, all three TCP flag masks were in the range 0 to 255
 The dataset and simulated NFStream paths produce identical vectors on the shared fixture. The computed source byte rate is 867.816091954023 and the fixture expects 867.8160919540229. The shared validator uses exact equality. Anas owns the comparison policy. Actual NFStream packet bins and direction still require a gateway comparison.
 
 Dataset reference: Sarhan, Layeghy and Portmann, Towards a Standard Feature Set for Network Intrusion Detection System Datasets. https://doi.org/10.1007/s11036-021-01843-0
+
+## Packet-size bins and dataset coverage
+
+The fixture supplies five precomputed counters. Unit tests exercise reading those counters from udps. Live verification requires NFStream with IP-size accounting and the gateway bin plugin. Compare a capture with known IP lengths at 128, 256, 512, 1024 and 1514 bytes and immediately above each boundary. Confirm that the first packet is counted once and packets above 1514 bytes contribute to none of the five bins.
+
+The 1,000-row rate comparison is an ordered sample from one dataset. It does not establish parity across the full CSV or between real gateway exports and labeled flows. For the integration check, use a capture with a known initiator, compare both directional counters and all five bins, and record the capture settings with the result.

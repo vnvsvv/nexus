@@ -77,7 +77,9 @@ def _rates(counters: Mapping[str, int]) -> dict[str, float]:
     }
 
 
-def _vector(features: Mapping[str, Any]) -> list[float]:
+def validated_vector(features: Mapping[str, Any]) -> list[float]:
+    if "ORDER" in features or any(isinstance(value, bool) for value in features.values()):
+        raise ValueError("expected numeric nf-lite-1 features in canonical order")
     model = NfLite1.model_validate(features)
     vector = model.vector()
     if any(not isfinite(value) or value < 0 for value in vector):
@@ -103,7 +105,7 @@ def from_dataset_row(
         if recompute_rates
         else {name: float(row[name.upper()]) for name in _RATE_FIELDS}
     )
-    return _vector({**features, **rates, "mean_pkt_size": mean_size})
+    return validated_vector({**features, **rates, "mean_pkt_size": mean_size})
 
 
 def from_nflow_fields(fields: Mapping[str, Any]) -> list[float]:
@@ -117,7 +119,7 @@ def from_nflow_fields(fields: Mapping[str, Any]) -> list[float]:
     bins = fields["udps"]
     for name, attr in _BINS.items():
         features[name] = _counter(bins[attr], f"udps.{attr}")
-    return _vector(
+    return validated_vector(
         {**features, **_rates(features), "mean_pkt_size": fields["bidirectional_mean_ps"]}
     )
 
