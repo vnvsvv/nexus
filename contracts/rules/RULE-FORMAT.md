@@ -56,6 +56,8 @@ steps:
 
 `lineage.relation` ∈ `same` (same process as step `of`), `child_of`, `descendant_of` (with `max_depth`, `include_self`). Lineage is evaluated on the endpoint process graph using `process_instance_id` and `PARENT_OF` edges; placeholder nodes count, but a path through a placeholder lowers incident `confidence` to `medium` and records `IDENTITY_INFERRED`.
 
+Sequence semantics (clarification; the format is unchanged). Each step binds a **different** event. `window_seconds` is inclusive and spans the earliest and latest bound **event timestamps**. `ordered: true` orders steps by event timestamp, with equal timestamps ordered by arrival at the engine (never by event id). Any step's event may complete a sequence, so out-of-order delivery is handled. The match time is the latest bound timestamp. The engine's selection between several valid bindings is described in `docs/02-CORRELATION.md` section 3.
+
 ## Predicates (closed set)
 
 | Operator | Applies to | Semantics |

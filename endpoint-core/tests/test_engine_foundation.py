@@ -31,7 +31,7 @@ FIX = ROOT / "contracts" / "fixtures"
 LOG = "nexus_endpoint_core.engine"
 NOW = datetime(2026, 11, 15, 10, 0, 0, tzinfo=timezone.utc)
 _ids = itertools.count(1)
-EMPTY_STATE = {"seen_events": 0, "suppression_entries": 0}
+EMPTY_STATE = {"seen_events": 0, "suppression_entries": 0, "candidate_events": 0}
 
 
 # ------------------------------------------------------------------ builders
