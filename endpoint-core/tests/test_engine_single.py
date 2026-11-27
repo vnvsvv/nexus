@@ -1,4 +1,4 @@
-"""Single-rule evaluation and root selection (task A3a step 3). Sequence and threshold rules are not evaluated yet."""
+"""Single-rule evaluation and root selection (task A3a step 3). Sequence rules: test_engine_sequence.py."""
 from __future__ import annotations
 
 import itertools
@@ -416,7 +416,7 @@ def test_other_endpoints_never_produce_detections_or_state(shipped):
     engine, graph = windows(shipped)
     foreign = feed(engine, graph, mk(endpoint="other-vm", proc="lab"))
     assert foreign.disposition == "foreign" and foreign.matches == () and dict(engine.state_sizes()) == {
-        "seen_events": 0, "suppression_entries": 0}
+        "seen_events": 0, "suppression_entries": 0, "candidate_events": 0}
     assert feed(engine, graph, mk(proc="lab")).matches[0].root_process_instance_id == f"{WIN}:lab"
 
 
@@ -473,12 +473,13 @@ def test_the_engine_module_still_never_runs_the_standard_regex_engine():
     assert "import re" not in source and "re.search" not in source and "re" not in vars(engine_module)
 
 
-def test_sequence_and_threshold_rules_are_not_evaluated_in_this_step(shipped):
+def test_sequence_rules_detect_and_threshold_rules_are_still_not_evaluated(shipped):
     engine, graph = windows(shipped)
     stream = [mk(proc="ps", binary="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", t=0,
                  command_line="powershell.exe -ExecutionPolicy Bypass -File x.ps1"),
               mk(proc="ps", etype="file_access", t=1), mk(proc="ps", etype="network_connect", t=2)]
-    assert [feed(engine, graph, e).matches for e in stream] == [(), (), ()]       # NX-WIN-001 / NX-WIN-003 arrive with A3b
+    results = [feed(engine, graph, e).matches for e in stream]
+    assert results[:2] == [(), ()] and [m.rule.id for m in results[2]] == ["NX-WIN-001"]   # NX-WIN-003 (threshold): not yet
     assert engine.stats().events_evaluated == 3
 
 

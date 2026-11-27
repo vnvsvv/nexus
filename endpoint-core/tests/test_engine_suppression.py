@@ -481,12 +481,12 @@ def test_an_evaluated_event_that_matches_nothing_is_deduplicated_unlike_one_no_r
 
     stats = engine.stats()
     assert (stats.events_received, stats.events_evaluated, stats.events_ignored_duplicate, stats.events_ignored_no_rules) == (5, 2, 1, 2)
-    assert engine.arrival_count == 2 and dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0}
+    assert engine.arrival_count == 2 and dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0, "candidate_events": 0}
     assert suppression_counters(engine) == (0, 0, 0, 0)
 
 
-# A3a does not evaluate sequence or threshold rules. Their events are still ACCEPTED (a rule is indexed for the event type)
-# and tracked. A3b must keep tracking them, including an anchor whose search finds nothing.
+# An event that only sequence or threshold steps listen to is ACCEPTED and tracked even when it completes nothing: a
+# sequence anchor whose search finds no binding (it becomes a candidate), and threshold rules (not evaluated yet).
 @pytest.mark.parametrize("extra", [
     {"event_type": "file_access", "file": {"path": "C:\\Lab\\staging\\report.zip", "operation": "write"}},
     {"event_type": "network_connect", "network": {"protocol": "TCP", "src_ip": "192.168.30.10", "src_port": 50000,
@@ -501,7 +501,7 @@ def test_an_event_only_sequence_or_threshold_rules_listen_to_is_tracked_but_dete
     assert event.event_id in engine._seen
     assert feed(engine, graph, event).disposition == "duplicate"
     assert engine.stats().events_ignored_no_rules == 0 and engine.stats().events_ignored_duplicate == 1
-    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0} and suppression_counters(engine) == (0, 0, 0, 0)
+    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0, "candidate_events": 1} and suppression_counters(engine) == (0, 0, 0, 0)
 
 
 # ------------------------------------------------------------------ first arrival wins
@@ -515,7 +515,7 @@ def test_the_first_arrival_of_an_event_id_wins_over_later_content_that_would_mat
     assert second.disposition == "duplicate" and second.matches == () and second.suppressed == ()
     assert graph.get(f"{WIN}:c1").binary == CMD                                # the graph kept the first content too
     assert suppression_counters(engine) == (0, 0, 0, 0) and engine.stats().events_ignored_duplicate == 1
-    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0}
+    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0, "candidate_events": 0}
 
     control, control_graph = setup(shipped)                                    # the later content does satisfy two rules by itself
     alone = feed(control, control_graph, mk("c1", 2, "par", attributes={"ti_hash_hit": True}))
@@ -531,7 +531,7 @@ def test_a_reused_event_id_naming_another_process_creates_no_node_and_no_match(s
     other = feed(engine, graph, mk("c2", 2, "par", event_id=shared))
     assert other.disposition == "not_in_graph" and other.matches == () and other.suppressed == ()
     assert graph.get(f"{WIN}:c2") is None and suppression_counters(engine) == (0, 0, 0, 0)
-    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0}
+    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0, "candidate_events": 0}
 
 
 # ------------------------------------------------------------------ the placeholder counter counts (rule, event) pairs
@@ -545,7 +545,7 @@ def test_a_redelivered_seeded_placeholder_start_is_not_counted_again(shipped):
         assert again.disposition == "duplicate" and again.matches == () and again.suppressed == ()
         assert engine.stats().placeholder_starts_skipped == 2
     assert engine.stats().events_ignored_duplicate == 3 and suppression_counters(engine) == (0, 0, 0, 0)
-    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0}
+    assert dict(engine.state_sizes()) == {"seen_events": 2, "suppression_entries": 0, "candidate_events": 0}
 
     another = mk("seed", 2, "par", attributes=attributes)                      # a second event for the SAME placeholder process
     assert feed(engine, graph, another).disposition == "evaluated"

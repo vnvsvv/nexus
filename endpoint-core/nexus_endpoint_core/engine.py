@@ -1,9 +1,9 @@
-"""Rule engine (task A3a): foundation (step 2) plus single-rule evaluation and suppression (step 3).
+"""Rule engine (task A3a, and A3b phase 1: sequence rules).
 
 Implemented: construction, startup policy, deterministic indexes, validated limits, the safeguards every event passes
-through, evaluation of ``kind: single`` rules, root selection and bounded suppression. NOT implemented yet (A3b):
-sequence and threshold rules. An event that only sequence or threshold steps listen to is accepted and counted but
-produces no detection.
+through, evaluation of ``kind: single`` and ``kind: sequence`` rules, root selection and bounded suppression. NOT
+implemented yet (A3b phase 2): threshold rules. An event that only threshold steps listen to is accepted and counted
+but produces no detection.
 
 Calling contract (one engine per endpoint, single-threaded)
     for event in adapter:
@@ -63,11 +63,63 @@ Single rules
     event as evidence, the root process, the placeholder and inferred-identity facts for A4, and the response target,
     and converts to the contract ``RuleMatch`` with ``to_contract()``.
 
+Sequence rules (bounded candidates, bounded search)
+    Candidates. For every enabled sequence rule and step, an accepted event that satisfies the step's ``where`` (and
+    is not a seeded placeholder start) is kept as a candidate, with its timestamp in milliseconds and its arrival rank.
+    The store deduplicates event ids itself (first arrival wins), so a redelivery after the ``_seen`` horizon adds
+    nothing. Nothing is removed by time, so a late, out-of-order event can still pair with older ones. Above
+    ``max_candidates_per_step`` the OLDEST candidate by (timestamp, arrival) is removed, possibly the new one itself:
+    ``sequence_candidates_expired`` if it was already outside the rule window at the new event's time, else
+    ``sequence_candidates_evicted`` (rate-limited warning: a detection that needed it may be missed). Both labels are
+    relative to that one event's time, like the suppression counters. "Expired" does not mean the candidate could never
+    have mattered: under out-of-order delivery a later event stamped near it could still have needed it, so both
+    counters are coverage-loss signals, the second one the stronger. The startup capacity check guarantees that the
+    per-step limits never add up to more than ``max_total_candidate_events``.
+
+    Search. Every event that satisfies at least one step is also an ANCHOR at that step (any step, not only the last,
+    so a sequence completed by a late event is still found). The other steps are bound from their candidate stores by a
+    depth-first search in rule-step order, over every anchor position of the event (in step order), and the search
+    ENUMERATES distinct roots: each complete binding's root is selected as below, the first binding found for a root is
+    that root's preferred binding, and later bindings of the same root are dropped. One detection is reported per
+    distinct ``(rule, root)``, in discovery order, each with its own binding, evidence and facts; evidence of different
+    roots is never combined. In an ordered rule the earliest bound event is step 0's, so the step-0 candidate fixes the
+    root: a candidate whose root is already found is skipped and, once a binding completes, the search moves on to the
+    next step-0 candidate. An unordered rule has no such shortcut and spends budget on equivalent bindings. A binding
+    must satisfy:
+    * one event per step: a single event never fills two steps;
+    * the window: the span between the earliest and latest bound timestamps is at most ``window_seconds`` (inclusive);
+    * order (``ordered: true``): steps follow the listed order by (timestamp, arrival rank), so equal timestamps are
+      ordered by acceptance and never by event id; ``ordered: false`` has no order constraint;
+    * lineage, on the graph at the time of the anchor: ``same`` is the same ``process_instance_id``; ``child_of`` is one
+      observed parent link; ``descendant_of`` follows up to ``max_depth`` observed parent links (``include_self`` also
+      accepts the same process). Links are followed through placeholders, never across a missing node, and nothing is
+      inferred from PIDs;
+    * every bound process is still in the graph. A candidate whose process left it is skipped and
+      ``sequence_candidates_unavailable`` counts the (rule, event).
+    Per step, candidates are tried nearest to the anchor's time first, then latest arrival; at most
+    ``max_search_candidates`` are tried (``sequence_searches_truncated``). ONE budget of ``max_search_nodes`` examined
+    candidates covers every anchor position of a (rule, event); when it runs out the search stops, the roots already
+    found are reported, and ``sequence_searches_exhausted`` counts it (rate-limited warning). A search that ends exactly
+    at the budget is complete and is not counted. These three counters are counted once per (rule, event), also when
+    roots were found, because another root may have been missed: they mark incomplete coverage, not only a missed
+    detection. A position where some step has no candidate at all cannot bind, so limits on its other steps are not a
+    loss; neither is a plain miss.
+
+    Result. ``matched_at`` is the latest bound event's time (the trigger's when events arrive in order); suppression
+    is keyed and timed by it. The root is selected from the process of the EARLIEST bound event (docs/02 section 4:
+    ``max_ancestors`` counts from the earliest bound process). ``placeholder_process_ids`` lists placeholder bound
+    processes, then placeholders on the lineage paths between bound processes. ``identity_inferred_event_ids`` lists
+    bound events whose ``identity_resolution`` is not "native". ``response_target_process_id`` is the process of
+    ``response.target_step``. Candidates are not consumed by a match: a later completion for the same root is a
+    ``SuppressedMatch`` carrying its full binding as evidence. Suppression is per ``(rule, root)``: each root found by
+    one evaluation is registered once, independently, so one event may yield a new match for one root and a repeat for
+    another, and a repeat of root A never suppresses root B.
+
 Root selection (never decides whether a rule matches)
-    From the process of the matching event, follow the OBSERVED parent links up to ``context.max_ancestors``
-    generations, by ``process_instance_id`` only. The climb stops before a parent that is missing from the graph
-    (never observed, or evicted), a placeholder, or a process on the system stop list (``root_stop_binaries``, compared
-    by case-folded file name). Nothing is invented: ``root_parent_missing`` and ``root_parent_is_placeholder`` report a
+    From the process of the matching event (for a sequence, of its earliest bound event), follow the OBSERVED
+    parent links up to ``context.max_ancestors`` generations, by ``process_instance_id`` only. The climb stops before
+    a parent that is missing from the graph (never observed, or evicted), a placeholder, or a process on the system
+    stop list (``root_stop_binaries``, compared by case-folded file name). Nothing is invented: ``root_parent_missing`` and ``root_parent_is_placeholder`` report a
     gap for A4 instead of filling it, and a stop-list boundary or the generation cap is not a gap.
 
 Suppression (sliding window, bounded)
@@ -125,7 +177,7 @@ from nexus_contracts import RuleMatch as ContractRuleMatch
 
 from .graph import ProcessGraph, format_utc, parse_utc
 from .predicates import RegexBackend, evaluate_where, has_regex
-from .rules import Rule, RuleError, RuleSet, Step
+from .rules import Lineage, Rule, RuleError, RuleSet, Step
 
 log = logging.getLogger(__name__)
 
@@ -270,6 +322,15 @@ class EngineStats:
     # The next two are judged at the triggering event's time only (module docstring, "Suppression"):
     suppression_expired: int = 0              # entries expired then: replaced by their key, or removed at the cap
     suppression_evicted: int = 0              # entries live then but removed at the cap: a possible duplicate match
+    # Sequence coverage (module docstring, "Sequence rules"). The first two are judged at the triggering event's time.
+    sequence_candidates_expired: int = 0      # dropped at max_candidates_per_step, outside the window of the event that
+    #                                           caused the drop (a later, out-of-order event might still have needed it)
+    sequence_candidates_evicted: int = 0      # dropped at max_candidates_per_step while inside that window: likely loss
+    # The next three count (rule, event) evaluations whose search may be INCOMPLETE, once each whatever the number of
+    # anchor positions, and also when some roots were found: another root may have been missed.
+    sequence_searches_truncated: int = 0      # candidates past max_search_candidates were not tried
+    sequence_searches_exhausted: int = 0      # the shared max_search_nodes budget ran out before the search ended
+    sequence_candidates_unavailable: int = 0  # in-window candidates were skipped because their process left the graph
     rules_enabled: int = 0
     rules_disabled: int = 0
     rules_rejected_at_load: int = 0
@@ -295,10 +356,10 @@ class EngineMatch:
     bindings: Mapping[str, str]                    # step -> event_id (a threshold uses hit_001, hit_002, ...)
     events: Mapping[str, HostEvent]                # step -> the bound event (same keys as bindings, or a subset)
     root_process_instance_id: str
-    matched_at: datetime                           # time of the triggering event
+    matched_at: datetime                           # time of the latest bound event (a single rule: the triggering one)
     trigger_event_id: str
     process_by_step: Mapping[str, str] = field(default_factory=dict)
-    placeholder_process_ids: tuple[str, ...] = ()
+    placeholder_process_ids: tuple[str, ...] = ()       # placeholder bound processes, then placeholders on lineage paths
     identity_inferred_event_ids: tuple[str, ...] = ()   # bound events whose identity_resolution is not "native"
     root_parent_is_placeholder: bool = False
     root_parent_missing: bool = False
@@ -395,6 +456,12 @@ def _is_seeded_placeholder_start(event: HostEvent) -> bool:
     return attributes.get("placeholder") is True or attributes.get("identity_resolution") == "placeholder"
 
 
+def _is_inferred(event: HostEvent) -> bool:
+    """The sensor reported a process identity other than its native id (``identity_resolution`` is not "native")."""
+    resolution = event.attributes.get("identity_resolution")
+    return isinstance(resolution, str) and resolution != "native"
+
+
 def _file_name(path: str) -> str:
     return path.replace("\\", "/").rsplit("/", 1)[-1].casefold()
 
@@ -426,6 +493,53 @@ def _select_root(graph: ProcessGraph, node: Any, max_ancestors: int, stop_binari
     parent = graph.get(parent_id) if parent_id is not None else None
     return _Root(current.process_instance_id, parent is not None and parent.placeholder,
                  parent_id is not None and parent is None)
+
+
+# ---------------------------------------------------------------------------------------------- sequence helpers
+@dataclass(frozen=True, eq=False)
+class _Candidate:
+    """An accepted event that satisfied one sequence step's ``where``. ``rank`` is its arrival rank (``arrival_count``
+    when it was accepted); ``(t_ms, rank)`` orders events: by timestamp, equal timestamps by arrival, never by id."""
+
+    event: HostEvent
+    t_ms: int
+    rank: int
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return self.t_ms, self.rank
+
+
+class _SearchExhausted(Exception):
+    """Internal: the search reached ``max_search_nodes``."""
+
+
+def _lineage_path(graph: ProcessGraph, child: str, of: str, lineage: Lineage) -> list[Any] | None:
+    """The intermediate nodes between ``child`` and ``of`` if ``child`` satisfies ``lineage`` relative to ``of``,
+    else None. Follows OBSERVED parent links by ``process_instance_id`` (through placeholders, as ``RULE-FORMAT.md``
+    says); stops at a missing node or a cycle, so no relationship is ever invented."""
+    if lineage.relation == "same":
+        return [] if child == of else None
+    depth = 1 if lineage.relation == "child_of" else lineage.max_depth
+    if child == of:
+        return [] if lineage.relation == "descendant_of" and lineage.include_self else None
+    path: list[Any] = []
+    seen = {child}
+    current = graph.get(child)
+    for _ in range(depth or 0):
+        if current is None:
+            return None
+        parent_id = current.parent_process_instance_id
+        if parent_id is None or parent_id in seen:
+            return None
+        if parent_id == of:
+            return path
+        seen.add(parent_id)
+        current = graph.get(parent_id)
+        if current is None:
+            return None
+        path.append(current)
+    return None
 
 
 class RuleEngine:
@@ -481,13 +595,19 @@ class RuleEngine:
         self._check_candidate_capacity()
         self._index = self._build_index()
         self._singles = self._build_singles()
+        self._sequences = self._build_sequences()
         self._window_ms = {rule.id: round(rule.context.incident_window_seconds * 1000) for rule in self.enabled_rules}
+        self._sequence_window_ms = {rule.id: round(rule.window_seconds * 1000)
+                                    for rule in self.enabled_rules if rule.kind == "sequence"}
+        self._step_index = {rule.id: {step.name: i for i, step in enumerate(rule.steps)}
+                            for rule in self.enabled_rules if rule.kind == "sequence"}
         # Runtime state starts empty and only ever grows to its limit:
-        # TODO(A3b): sequence/threshold candidate state must deduplicate event ids itself (this horizon is bounded) and
-        # must not prune by the triggering event's time alone.
         self._seen: OrderedDict[str, None] = OrderedDict()                    # duplicate horizon (max_seen_events)
         # (rule, root) -> (last_ms, expires_ms), least recently updated first; expired entries stay until replaced/removed
         self._suppression: OrderedDict[tuple[str, str], tuple[int, int]] = OrderedDict()
+        # (rule id, step index) -> event id -> candidate, in insertion order; at most max_candidates_per_step each. The
+        # store deduplicates event ids itself (first arrival wins), so it stays correct after an id leaves _seen.
+        self._candidates: dict[tuple[str, int], OrderedDict[str, _Candidate]] = {}
         self._counters = dict.fromkeys(_COUNTERS, 0)
         self._report_startup()
 
@@ -533,6 +653,18 @@ class RuleEngine:
                     singles.setdefault((os_name, step.event_type), []).append((rule, step))
         return MappingProxyType({key: tuple(singles[key]) for key in sorted(singles)})
 
+    def _build_sequences(self) -> Mapping[tuple[str, str], tuple[tuple[Rule, tuple[int, ...]], ...]]:
+        """(os, event type) -> the sequence rules with steps of that type, in rule-id order, and those step indexes."""
+        sequences: dict[tuple[str, str], list[tuple[Rule, tuple[int, ...]]]] = {}
+        for rule in self.enabled_rules:                              # rule ids ascending
+            if rule.kind != "sequence":
+                continue
+            for os_name in sorted(rule.os):
+                for event_type in sorted({step.event_type for step in rule.steps}):
+                    indexes = tuple(i for i, step in enumerate(rule.steps) if step.event_type == event_type)
+                    sequences.setdefault((os_name, event_type), []).append((rule, indexes))
+        return MappingProxyType({key: tuple(sequences[key]) for key in sorted(sequences)})
+
     def _report_startup(self) -> None:
         for item in self.disabled_rules:
             log.error("rule disabled at startup: %s: %s", item.rule_id, item.reason)
@@ -577,9 +709,11 @@ class RuleEngine:
         """How many items each runtime structure retains now. Structures a later step adds start at zero.
 
         These are retained items, not live ones: ``suppression_entries`` includes entries that have expired relative to a
-        later event and have not been replaced or removed.
+        later event and have not been replaced or removed, and ``candidate_events`` counts sequence candidates in all
+        step stores (one event counts once per step it satisfies), whatever their age.
         """
-        return MappingProxyType({"seen_events": len(self._seen), "suppression_entries": len(self._suppression)})
+        return MappingProxyType({"seen_events": len(self._seen), "suppression_entries": len(self._suppression),
+                                 "candidate_events": sum(len(store) for store in self._candidates.values())})
 
     def stats(self) -> EngineStats:
         return EngineStats(**self._counters, rules_enabled=len(self.enabled_rules),
@@ -598,18 +732,18 @@ class RuleEngine:
         return EngineResult(disposition=disposition)
 
     def evaluate(self, graph: ProcessGraph, event: HostEvent) -> EngineResult:
-        """Run one event, already applied to ``graph``, through the safeguards and then the single rules.
+        """Run one event, already applied to ``graph``, through the safeguards and then the single and sequence rules.
 
         ``disposition`` reports what happened to the event. Checks, in order: identity and endpoint isolation, future
         timestamp (live mode), presence of its process in the graph, whether any enabled rule listens to it,
         duplicate id (best effort, see the module docstring). An accepted event is evaluated against every enabled
-        ``single`` rule of its OS and event type, in rule-id order; each qualifying detection is either a new
-        ``EngineMatch`` or, while its suppression entry has not expired at this event's time, a ``SuppressedMatch``.
-        Sequence and threshold rules are not evaluated yet. An exception from a regex backend propagates (a defect is
-        not hidden).
+        ``single`` and ``sequence`` rule of its OS and event type; results are in rule-id order. Each qualifying
+        detection is either a new ``EngineMatch`` or, while its suppression entry has not expired at the detection's
+        time, a ``SuppressedMatch``. Threshold rules are not evaluated yet. An exception from a regex backend propagates
+        (a defect is not hidden).
 
         Exception safety: evaluation is prepared first and committed afterwards. An exception raised before the commit
-        leaves suppression state, detection counters, the seen record and the engine's identity untouched (only
+        leaves suppression state, sequence candidates, detection counters, the seen record and the engine's identity untouched (only
         ``events_received`` counts the call), so the same event can be retried. A skipped event differs: its skip counter
         advances before its diagnostic is logged. Diagnostics are logged only after the state is recorded, and a logging
         handler or filter that raises ``Exception`` is ignored (see ``_log_safely``).
@@ -646,7 +780,7 @@ class RuleEngine:
         if event.event_id in self._seen:
             return self._skip("duplicate", "events_ignored_duplicate", "", warn=False)
 
-        matches, suppressed, evictions = self._evaluate_singles(graph, event)
+        matches, suppressed, warnings = self._evaluate_rules(graph, event)
 
         # TODO(A8): recover from a fatal error after the commit: the results are lost and a retry may not restore them.
         if self._endpoint_id is None:                                   # only an accepted event may fix the identity
@@ -657,33 +791,36 @@ class RuleEngine:
             self._seen.popitem(last=False)
             self._counters["seen_evicted"] += 1
         self._counters["events_evaluated"] += 1
-        for evicted_so_far in evictions:                                # state is final: only now may logging run
-            _log_safely(logging.WARNING, "suppression state is full (%d entries): a live entry was evicted (%d so far); "
-                        "repeats of that detection may fire again", self.limits.max_suppression_entries, evicted_so_far)
+        for message, args in warnings:                                  # state is final: only now may logging run
+            _log_safely(logging.WARNING, message, *args)
         return EngineResult(tuple(matches), tuple(suppressed))
 
-    # -- single rules ------------------------------------------------------------------------------
-    def _evaluate_singles(self, graph: ProcessGraph, event: HostEvent) -> tuple[list[EngineMatch], list[SuppressedMatch], list[int]]:
-        """Returns the matches, the suppressed repeats, and the eviction counts whose warning the caller should log."""
+    # -- single and sequence rules -----------------------------------------------------------------
+    def _evaluate_rules(self, graph: ProcessGraph, event: HostEvent
+                        ) -> tuple[list[EngineMatch], list[SuppressedMatch], list[tuple[str, tuple[object, ...]]]]:
+        """Returns the matches, the suppressed repeats, and the warnings (message, args) the caller logs afterwards."""
         matches: list[EngineMatch] = []
         suppressed: list[SuppressedMatch] = []
-        evictions: list[int] = []
+        warnings: list[tuple[str, tuple[object, ...]]] = []
         singles = self._singles.get((event.os, event.event_type), ())
-        if not singles:
-            return matches, suppressed, evictions
+        sequences = self._sequences.get((event.os, event.event_type), ())
+        if not singles and not sequences:
+            return matches, suppressed, warnings
         seeded = event.event_type == "process_start" and _is_seeded_placeholder_start(event)
         node = graph.get(event.process_instance_id)                     # present: evaluate() checked
         moment = parse_utc(event.timestamp_utc)
         t_ms = _to_ms(moment)
-        resolution = event.attributes.get("identity_resolution")
-        inferred = (event.event_id,) if isinstance(resolution, str) and resolution != "native" else ()
+        inferred = (event.event_id,) if _is_inferred(event) else ()
 
-        # Phase 1 - prepare. The work a defect could break (predicates, which may run a regex backend; root selection;
-        # building the result objects) happens here, and nothing in the engine is mutated: an exception leaves no trace
-        # beyond events_received, so a retry of the same event behaves as if the failed call never happened. Both possible
-        # results are built because whether a hit is new or a repeat is only known when it is committed.
-        prepared: list[tuple[tuple[str, str], int, EngineMatch, SuppressedMatch]] = []
+        # Phase 1 - prepare. The work a defect could break (predicates, which may run a regex backend; the sequence
+        # search; root selection; building the result objects) happens here, and nothing in the engine is mutated: an
+        # exception leaves no trace beyond events_received, so a retry of the same event behaves as if the failed call
+        # never happened. Both possible results are built because whether a hit is new or a repeat is only known when it
+        # is committed. The search only reads the candidate stores; the event joins them in phase 2.
+        prepared: list[tuple[str, tuple[str, str], int, int, EngineMatch, SuppressedMatch]] = []
         skipped_placeholders = 0
+        inserts: list[tuple[tuple[str, int], _Candidate, int]] = []    # (store key, candidate, rule window in ms)
+        losses: list[str] = []                                          # counter names, one per failed (rule, event)
         for rule, step in singles:                                      # rule ids ascending
             if not evaluate_where(step.where, event, regex_backend=self._regex_backend):
                 continue
@@ -701,23 +838,239 @@ class RuleEngine:
                 response_target_process_id=node.process_instance_id if rule.response is not None else None)
             repeat = SuppressedMatch(rule=rule, root_process_instance_id=root.process_id, matched_at=moment,
                                      trigger_event_id=event.event_id, bindings=bindings, events=bound)
-            prepared.append(((rule.id, root.process_id), self._window_ms[rule.id], fresh, repeat))
+            prepared.append((rule.id, (rule.id, root.process_id), t_ms, self._window_ms[rule.id], fresh, repeat))
+
+        rank = self._counters["events_evaluated"]                       # this event's arrival rank once accepted
+        anchor = _Candidate(event, t_ms, rank)
+        for rule, step_indexes in sequences:                            # rule ids ascending
+            satisfied = [i for i in step_indexes
+                         if evaluate_where(rule.steps[i].where, event, regex_backend=self._regex_backend)]
+            if not satisfied:
+                continue
+            if seeded:                                                  # never a candidate, never an anchor
+                skipped_placeholders += 1
+                continue
+            window_ms = self._sequence_window_ms[rule.id]
+            inserts += [((rule.id, i), anchor, window_ms) for i in satisfied]
+            roots, missed = self._enumerate_sequence(graph, rule, satisfied, anchor)
+            losses += sorted(missed)                                    # also when some roots were found
+            for binding, root in roots:                                 # one per distinct root, in discovery order
+                fresh, repeat, latest_ms = self._sequence_results(graph, rule, binding, root, event.event_id)
+                prepared.append((rule.id, (rule.id, root.process_id), latest_ms, self._window_ms[rule.id], fresh, repeat))
+        prepared.sort(key=lambda item: item[0])                         # rule-id order; stable within a rule
 
         # Phase 2 - commit. Only dictionary and counter bookkeeping on values prepared above; no predicate, graph,
         # object construction or logging runs here (warnings are returned and logged after the event is recorded). It is
         # not atomic: a fatal exception such as MemoryError can still interrupt it part way (see evaluate).
         self._counters["placeholder_starts_skipped"] += skipped_placeholders
-        for key, window_ms, fresh, repeat in prepared:
-            repeat_hit, evicted_so_far = self._register_hit(key, t_ms, window_ms)
+        for name in losses:
+            self._counters[name] += 1
+            if name == "sequence_searches_exhausted" and (self._counters[name] == 1 or self._counters[name] % _WARN_EVERY == 0):
+                warnings.append(("sequence search stopped at max_search_nodes (%d) before it ended (%d so far); a "
+                                 "detection, or another root, may have been missed",
+                                 (self.limits.max_search_nodes, self._counters[name])))
+        for store_key, candidate, window_ms in inserts:
+            evicted_so_far = self._store_candidate(store_key, candidate, window_ms)
             if evicted_so_far is not None:
-                evictions.append(evicted_so_far)
+                warnings.append(("sequence candidate store %s step %d is full (%d events): an in-window candidate was "
+                                 "evicted (%d so far); a detection may be missed",
+                                 (store_key[0], store_key[1], self.limits.max_candidates_per_step, evicted_so_far)))
+        for _, key, hit_ms, window_ms, fresh, repeat in prepared:
+            repeat_hit, evicted_so_far = self._register_hit(key, hit_ms, window_ms)
+            if evicted_so_far is not None:
+                warnings.append(("suppression state is full (%d entries): a live entry was evicted (%d so far); "
+                                 "repeats of that detection may fire again",
+                                 (self.limits.max_suppression_entries, evicted_so_far)))
             if repeat_hit:
                 self._counters["matches_suppressed"] += 1
                 suppressed.append(repeat)
             else:
                 self._counters["matches_emitted"] += 1
                 matches.append(fresh)
-        return matches, suppressed, evictions
+        return matches, suppressed, warnings
+
+    # -- sequence rules ----------------------------------------------------------------------------
+    def _candidate_pools(self, graph: ProcessGraph, rule: Rule, anchor_index: int, anchor: _Candidate
+                         ) -> tuple[dict[int, list[_Candidate]] | None, set[str]]:
+        """The candidates each other step may take with ``anchor`` at ``anchor_index``, best first, and the
+        coverage-loss names that apply. None when some step has no candidate at all: then no binding exists at this
+        anchor position, so limits on the other steps cost nothing (only a candidate skipped because its process left
+        the graph can explain that empty step)."""
+        window = self._sequence_window_ms[rule.id]
+        ordered = bool(rule.ordered)
+        limit = self.limits.max_search_candidates
+        missed: set[str] = set()
+        pools: dict[int, list[_Candidate]] = {}
+        for i in range(len(rule.steps)):
+            if i == anchor_index:
+                continue
+            pool, skipped = [], False
+            for candidate in self._candidates.get((rule.id, i), {}).values():
+                if candidate.event.event_id == anchor.event.event_id or abs(candidate.t_ms - anchor.t_ms) > window:
+                    continue
+                if ordered and (candidate.key < anchor.key) != (i < anchor_index):
+                    continue
+                if graph.get(candidate.event.process_instance_id) is None:     # its process left the graph
+                    skipped = True
+                    continue
+                pool.append(candidate)
+            if not pool:
+                return None, {"sequence_candidates_unavailable"} if skipped else set()
+            if skipped:
+                missed.add("sequence_candidates_unavailable")
+            pool.sort(key=lambda c: (abs(c.t_ms - anchor.t_ms), -c.rank))     # nearest in time, then latest arrival
+            if len(pool) > limit:
+                missed.add("sequence_searches_truncated")
+                del pool[limit:]
+            pools[i] = pool
+        return pools, missed
+
+    def _enumerate_sequence(self, graph: ProcessGraph, rule: Rule, anchor_indexes: list[int], anchor: _Candidate
+                            ) -> tuple[list[tuple[dict[int, _Candidate], _Root]], set[str]]:
+        """Every distinct root ``rule`` detects with ``anchor``, each with its preferred binding; never mutates.
+
+        Anchor positions are tried in step order and, per step, candidates best first (``_candidate_pools``), so the
+        first complete binding found for a root is its preferred one; later bindings for the same root are dropped. One
+        ``max_search_nodes`` budget covers every anchor position of this (rule, event). Returns ``(roots, missed)``:
+        ``(binding, root)`` pairs in discovery order, and the coverage-loss counter names that apply even when some
+        roots were found (budget exhausted, candidates truncated, candidates whose process left the graph).
+
+        In an ordered rule the earliest bound event is always step 0's, so its candidate fixes the root: a step-0
+        candidate whose root is already found is skipped, and the first completion below it ends that subtree. An
+        unordered rule has no such shortcut; equivalent bindings are deduplicated when they complete.
+        """
+        ordered = bool(rule.ordered)
+        roots: dict[str, tuple[dict[int, _Candidate], _Root]] = {}
+        missed: set[str] = set()
+        budget = [self.limits.max_search_nodes]
+
+        def root_of(candidate: _Candidate) -> _Root:
+            return _select_root(graph, graph.get(candidate.event.process_instance_id), rule.context.max_ancestors,
+                                self.root_stop_binaries)
+
+        try:
+            for anchor_index in anchor_indexes:
+                if ordered and anchor_index == 0 and root_of(anchor).process_id in roots:
+                    continue                     # this position can only find a root already found
+                pools, why = self._candidate_pools(graph, rule, anchor_index, anchor)
+                missed |= why
+                if pools is not None:
+                    self._bind_sequence(graph, rule, anchor_index, anchor, pools, roots, budget, root_of)
+        except _SearchExhausted:
+            missed.add("sequence_searches_exhausted")
+        return list(roots.values()), missed
+
+    def _bind_sequence(self, graph: ProcessGraph, rule: Rule, anchor_index: int, anchor: _Candidate,
+                       pools: Mapping[int, list[_Candidate]], roots: dict[str, tuple[dict[int, _Candidate], _Root]],
+                       budget: list[int], root_of: Callable[[_Candidate], _Root]) -> None:
+        """Depth-first search over ``pools`` in rule-step order, recording the first binding of each new root.
+        Each candidate examined costs one unit of ``budget``; ``_SearchExhausted`` is raised only when another
+        candidate would have to be examined after it reached zero, so a search that ends exactly at the budget is
+        complete."""
+        window = self._sequence_window_ms[rule.id]
+        ordered = bool(rule.ordered)
+        order = [i for i in range(len(rule.steps)) if i != anchor_index]
+        assigned: dict[int, _Candidate] = {anchor_index: anchor}
+
+        def fits(i: int, candidate: _Candidate) -> bool:
+            if any(other.event.event_id == candidate.event.event_id for other in assigned.values()):
+                return False                     # one event binds one step
+            times = [other.t_ms for other in assigned.values()]
+            if max(*times, candidate.t_ms) - min(*times, candidate.t_ms) > window:
+                return False
+            if ordered and any((j < i) != (other.key < candidate.key) for j, other in assigned.items()):
+                return False
+            trial = {**assigned, i: candidate}
+            for s, step in enumerate(rule.steps):
+                if step.lineage is None:
+                    continue
+                t = self._step_index[rule.id][step.lineage.of]
+                if i not in (s, t) or s not in trial or t not in trial:
+                    continue
+                if _lineage_path(graph, trial[s].event.process_instance_id, trial[t].event.process_instance_id,
+                                 step.lineage) is None:
+                    return False
+            return True
+
+        def bind(position: int) -> bool:
+            """True once a complete binding was reached below; in an ordered rule that settles the root of the step-0
+            candidate (or of the anchor at step 0), so the levels below step 0 stop exploring."""
+            if position == len(order):
+                binding = dict(assigned)
+                root = root_of(min(binding.values(), key=lambda c: c.key))     # the earliest bound event's process
+                roots.setdefault(root.process_id, (binding, root))            # the first, preferred, binding wins
+                return True
+            i = order[position]
+            for candidate in pools[i]:
+                if budget[0] <= 0:
+                    raise _SearchExhausted
+                budget[0] -= 1
+                if not fits(i, candidate):
+                    continue
+                if ordered and i == 0 and root_of(candidate).process_id in roots:
+                    continue                     # every binding below would give a root already found
+                assigned[i] = candidate
+                complete = bind(position + 1)
+                del assigned[i]
+                if complete and ordered and i != 0:
+                    return True                  # the root is fixed above this level
+            return False
+
+        bind(0)                                  # each lineage edge is checked when its second end is bound
+
+    def _sequence_results(self, graph: ProcessGraph, rule: Rule, found: Mapping[int, _Candidate], root: _Root,
+                          trigger_id: str) -> tuple[EngineMatch, SuppressedMatch, int]:
+        """Build both possible results of one root's binding, and return its latest bound event time in ms."""
+        steps = rule.steps
+        bound = {steps[i].name: found[i].event for i in range(len(steps))}
+        bindings = {name: event.event_id for name, event in bound.items()}
+        process_by_step = {name: event.process_instance_id for name, event in bound.items()}
+        latest = max(found.values(), key=lambda c: c.key)
+        placeholders: list[str] = []
+        for i in range(len(steps)):                                     # placeholder bound processes, in step order
+            pid = found[i].event.process_instance_id
+            if graph.get(pid).placeholder and pid not in placeholders:
+                placeholders.append(pid)
+        for i, step in enumerate(steps):                                # then placeholders on lineage paths
+            if step.lineage is None:
+                continue
+            t = self._step_index[rule.id][step.lineage.of]
+            path = _lineage_path(graph, found[i].event.process_instance_id, found[t].event.process_instance_id,
+                                 step.lineage) or []
+            placeholders += [n.process_instance_id for n in path if n.placeholder and n.process_instance_id not in placeholders]
+        matched_at = parse_utc(latest.event.timestamp_utc)
+        target = process_by_step[rule.response.target_step] if rule.response is not None else None
+        fresh = EngineMatch(
+            rule=rule, bindings=bindings, events=bound, root_process_instance_id=root.process_id, matched_at=matched_at,
+            trigger_event_id=trigger_id, process_by_step=process_by_step, placeholder_process_ids=tuple(placeholders),
+            identity_inferred_event_ids=tuple(e.event_id for e in bound.values() if _is_inferred(e)),
+            root_parent_is_placeholder=root.parent_is_placeholder, root_parent_missing=root.parent_missing,
+            response_target_process_id=target)
+        repeat = SuppressedMatch(rule=rule, root_process_instance_id=root.process_id, matched_at=matched_at,
+                                 trigger_event_id=trigger_id, bindings=bindings, events=bound)
+        return fresh, repeat, latest.t_ms
+
+    def _store_candidate(self, key: tuple[str, int], candidate: _Candidate, window_ms: int) -> int | None:
+        """Add an accepted event to one step's store; never logs. Returns the live-eviction count when a warning is due.
+
+        The first arrival of an event id wins. Above ``max_candidates_per_step`` the OLDEST candidate by (timestamp,
+        arrival) is removed, the new one included: it is ``expired`` if it was already outside the rule window at the
+        new event's time, else ``evicted`` (a detection that needed it may be missed). Nothing is removed by time alone.
+        """
+        store = self._candidates.setdefault(key, OrderedDict())
+        if candidate.event.event_id in store:
+            return None
+        store[candidate.event.event_id] = candidate
+        if len(store) <= self.limits.max_candidates_per_step:
+            return None
+        victim_id, victim = min(store.items(), key=lambda item: item[1].key)
+        del store[victim_id]
+        if victim.t_ms < candidate.t_ms - window_ms:
+            self._counters["sequence_candidates_expired"] += 1
+            return None
+        self._counters["sequence_candidates_evicted"] += 1
+        count = self._counters["sequence_candidates_evicted"]
+        return count if count == 1 or count % _WARN_EVERY == 0 else None
 
     def _register_hit(self, key: tuple[str, str], t_ms: int, window_ms: int) -> tuple[bool, int | None]:
         """Record a detection for ``key`` at event time ``t_ms``; never logs.

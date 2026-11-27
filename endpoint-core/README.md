@@ -5,28 +5,31 @@ objects from an adapter. Intended output: `Incident` and `ResponseResult` object
 yet**. Contracts are imported from `nexus_contracts`, never re-defined here.
 
 ## Status
-Tasks A1, A2 and A3a are in the package. It is a set of library building blocks, **not a working agent or a complete
-detection pipeline**.
+Tasks A1, A2, A3a and A3b phase 1 are in the package. It is a set of library building blocks, **not a working agent or
+a complete detection pipeline**.
 
 **Implemented and tested**
 * A1, `graph.py`: the process graph.
 * A2, `rules.py`: rule loading, validation and pre-compilation.
 * A3a, `engine.py` and `predicates.py`: the rule engine's startup policy and per-event safeguards, evaluation of
   `kind: single` rules, root selection, event-id deduplication and suppression.
+* A3b phase 1, `engine.py`: evaluation of `kind: sequence` rules with bounded candidate state and a bounded search
+  ([Sequence rules](#sequence-rules-a3b-phase-1)).
 
 **Implemented, with limitations that matter**
-* Only single-event rules detect: see [Detection coverage](#detection-coverage-today).
+* Threshold rules do not detect yet: see [Detection coverage](#detection-coverage-today).
 * `regex` predicates fail closed because no approved regex backend exists.
 * Known limits of the [graph](#known-limitations-of-the-graph), the
-  [rule loader](#known-limitations-and-open-questions-a2) and the [engine](#known-limitations-of-the-engine-a3a).
+  [rule loader](#known-limitations-and-open-questions-a2) and the [engine](#known-limitations-of-the-engine).
 
 **Not implemented**
-* A3b: sequence and threshold detection.
+* A3b phase 2: threshold detection.
 * Incident builder (A4), SQLite store (A5), transport, response gate (A6), agent loop and configuration (A8) and
   replay (A9). See `docs/01-ARCHITECTURE.md` section 2.2 and `docs/06-SIX-WEEK-PLAN.md`.
+* **Live integration is not proven.** No test feeds a real Linux or Windows sensor's output to the engine.
 
 ## Detection coverage today
-> **Only `kind: single` rules detect anything.** Sequence and threshold rules load, are enabled and are indexed, but
+> **Single and sequence rules detect; threshold rules do not.** Threshold rules load, are enabled and are indexed, but
 > they are **not evaluated**: their events are accepted and counted, and produce no match. `strict=True` does not
 > change this. It checks that startup is safe and that no rule was disabled or rejected, not that every enabled rule
 > can detect.
@@ -34,19 +37,19 @@ detection pipeline**.
 | Shipped rule | OS | Kind | Evaluated now |
 |---|---|---|---|
 | `NX-ANY-001` | linux, windows | single | yes, see below |
-| `NX-LIN-001` | linux | sequence | **no** |
+| `NX-LIN-001` | linux | sequence | yes |
 | `NX-LIN-002` | linux | threshold | **no** |
-| `NX-LIN-003` | linux | sequence | **no** |
-| `NX-WIN-001` | windows | sequence | **no** |
+| `NX-LIN-003` | linux | sequence | yes |
+| `NX-WIN-001` | windows | sequence | yes |
 | `NX-WIN-002` | windows | single | yes |
 | `NX-WIN-003` | windows | threshold | **no** |
 
-* Of the shipped rules that apply to each OS, **Linux evaluates 1 of 4** and **Windows 2 of 4**.
+* Of the shipped rules that apply to each OS, **Linux evaluates 3 of 4** and **Windows 3 of 4**.
 * `NX-ANY-001` needs the boolean `attributes.ti_hash_hit: true` on a `process_start`, set before `graph.apply`.
-* **Linux:** the engine can evaluate `NX-ANY-001` and matches a Linux event that carries that attribute. Nothing in this
-  repository populates it yet (the agent, A8, is meant to), and the other three shipped Linux rules need A3b. So
-  **automated Linux detection is not yet operational end to end**: on unenriched events no shipped Linux rule matches,
-  and nothing connects the Linux adapter to the engine.
+  Nothing in this repository populates it yet (the agent, A8, is meant to).
+* **Linux:** `NX-LIN-001` and `NX-LIN-003` now detect on synthetic events and on the `NX-LIN-001` fixture, but **automated
+  Linux detection is still not operational end to end**: nothing connects the Linux adapter to the engine, and no
+  test runs real Tetragon output through it. The same holds for Windows: there is no Windows adapter yet.
 * A rule that uses `regex` is disabled (and `strict=True` refuses to start) unless an approved, time-bounded backend
   is passed. `RegexBackend` is only the interface: **no implementation exists**. No shipped rule uses `regex`.
 
@@ -74,11 +77,12 @@ exits successfully: the events in `contracts/fixtures/rules/` are checked agains
 expected rule matches are not run. Its ML feature-parity check is likewise skipped when `nexus_ml` is not installed.
 
 What the package's own tests do with the rule fixtures:
-* only `NX-LIN-001` and `NX-WIN-001` have them, and both are sequence rules, which are not evaluated yet;
-* the graph tests build graphs from the events, the predicate tests check that each step is satisfied by exactly its
-  expected event (and that the benign set satisfies only the first step), and an engine test replays the benign set to
-  check dispositions;
-* **no test runs a fixture as a detection**. The single rules are tested with events built inside the tests.
+* only `NX-LIN-001` and `NX-WIN-001` have them; both are sequence rules;
+* `tests/test_engine_sequence.py` replays both through the engine and checks the expected bindings, root and processes
+  from their `.expect.json`, replays the `NX-LIN-001` events out of order, and checks that the benign set does not
+  fire. This is the package's own test, **not** the validator's fixture replay, which is still skipped;
+* the graph tests build graphs from the events, and the predicate tests check that each step is satisfied by exactly
+  its expected event. The single rules and `NX-LIN-003` have no fixture and are tested with events built in the tests.
 
 CI (`.github/workflows/ci.yml`) uses Ubuntu and Python 3.11 and also runs the Linux endpoint tests, which need Linux.
 
@@ -160,7 +164,7 @@ event; datetimes passed in must be timezone-aware.
 ## Rules loader (`nexus_endpoint_core.rules`, task A2)
 Turns `contracts/rules/*.yaml` (format: `contracts/rules/RULE-FORMAT.md`) into immutable, validated rule objects with
 regexes and CIDR networks compiled once. The loader never looks at events: evaluation is done by the
-[rule engine](#rule-engine-a3a), so far for `single` rules only.
+[rule engine](#rule-engine), so far for `single` and `sequence` rules.
 ```python
 from nexus_endpoint_core import load_rules, load_rule, load_attack_mapping
 rules = load_rules("contracts/rules")                   # RuleSet: .rules (sorted by id), .errors, .get(id), .for_os("linux")
@@ -242,9 +246,9 @@ is, the engine behaves as option (d) below.
   from task A3. Neither single rule has one.
 * The ATT&CK check mirrors `tools/validate_fixtures.py` (exact ordered list equality).
 
-## Rule engine (A3a)
-`engine.py` evaluates one `HostEvent` at a time against the loaded rules, using the process graph; `predicates.py` tests
-a step's `where` against an event. (`docs/01-ARCHITECTURE.md` section 2.2 places evaluation in `rules.py`; it is
+## Rule engine
+A3a and A3b phase 1. `engine.py` evaluates one `HostEvent` at a time against the loaded rules, using the process
+graph; `predicates.py` tests a step's `where` against an event. (`docs/01-ARCHITECTURE.md` section 2.2 places evaluation in `rules.py`; it is
 implemented in these two modules.) The engine returns **results**, not incidents: it builds no `Incident`, stores and
 sends nothing, and performs **no response**. The docstring of `engine.py` is the detailed reference.
 
@@ -362,15 +366,18 @@ one that applies decides the disposition. Each has its own `EngineStats` counter
 | `duplicate` | the event id is already remembered | `events_ignored_duplicate` |
 | `evaluated` | passed every check ("accepted"), with or without a match | `events_evaluated` |
 
-`evaluated` does not mean a rule ran: an event that only sequence or threshold steps listen to is `evaluated` and
-detects nothing. Matches and suppressed repeats are tuples in rule-id order. Results are immutable.
+`evaluated` does not mean a rule matched: an event that only threshold steps listen to is `evaluated` and detects
+nothing, and a sequence step's event is `evaluated` and stored as a candidate even when it completes nothing. Matches
+and suppressed repeats are tuples in rule-id order. Results are immutable.
 
 **`EngineMatch`** is a new detection:
-* what matched: `rule`, `bindings` (step name to event id), `events` (step name to `HostEvent`), `trigger_event_id`,
-  `matched_at`, `process_by_step`;
+* what matched: `rule`, `bindings` (step name to event id, in rule-step order), `events` (step name to `HostEvent`),
+  `trigger_event_id` (the event whose `evaluate` call completed it, always one of the bindings), `matched_at` (the
+  latest bound event's time; for a single rule, the event's own), `process_by_step`;
 * the root and facts for an incident builder: `root_process_instance_id`, `root_parent_is_placeholder`,
-  `root_parent_missing`, `placeholder_process_ids`, `identity_inferred_event_ids`. These do not cover
-  [unresolved ancestry](#unresolved-ancestry-requirement-for-a4);
+  `root_parent_missing`, `placeholder_process_ids` (placeholder bound processes, then placeholders on the lineage paths
+  between them), `identity_inferred_event_ids` (bound events whose `identity_resolution` is not `"native"`). These do
+  not cover [unresolved ancestry](#unresolved-ancestry-requirement-for-a4);
 * `response_target_process_id`, set when the rule declares a response. It is **only a request: nothing is terminated**;
 * `counted_process_id` and `distinct_count` belong to threshold rules and are always `None` today.
 
@@ -384,8 +391,9 @@ A seeded placeholder `process_start` (see [Placeholders](#process-graph-nexus_en
 never matches. `placeholder_starts_skipped` counts the refused (rule, event) pairs, not processes.
 
 ### Root selection
-From the matching process, the engine follows observed parent links up to the rule's `context.max_ancestors`
-generations. It stops before a parent that is missing, a placeholder, already visited, or named in the stop list
+From the matching process (for a sequence, the process of its **earliest** bound event, as `docs/02-CORRELATION.md`
+section 4 counts `max_ancestors` from the earliest bound process), the engine follows observed parent links up to the
+rule's `context.max_ancestors` generations. It stops before a parent that is missing, a placeholder, already visited, or named in the stop list
 (`DEFAULT_ROOT_STOP_BINARIES`, for example `systemd`, `sshd`, `explorer.exe`, `svchost.exe`; compared by file name,
 ignoring case). Nothing is invented: a missing or placeholder parent of the root is reported in the match. A parent
 that the sensor reported as unresolved is **not** (next section). Root selection never decides whether a rule matches.
@@ -454,42 +462,124 @@ again under the same id starts without it.
   relative to the triggering event's time, so out-of-order or future-dated events can make either label misleading.
 * The state is **not durable**: after a restart, a repeat that would have been suppressed is reported as new.
 
+### Sequence rules (A3b phase 1)
+A `kind: sequence` rule detects when every step is bound to its own accepted event and all constraints hold. The
+`engine.py` docstring ("Sequence rules") is the detailed reference.
+
+* **Candidates.** Each accepted event that satisfies a step's `where` is stored as a candidate for that step, with its
+  timestamp and arrival rank. Seeded placeholder starts are never candidates. A step store deduplicates event ids
+  itself (the first arrival wins), so a redelivery after the [dedup horizon](#deduplication-best-effort-bounded) adds
+  nothing. Nothing is removed because time passed: only the per-step cap removes candidates.
+* **Anchors.** An event that satisfies a step is also an anchor at that step, **whichever step it is**. A sequence
+  completed by a late, out-of-order event is therefore found, and the trigger is that late event.
+* **Constraints of a binding:**
+  * one event per step: an event never fills two steps of one binding;
+  * the window: the earliest and latest bound timestamps are at most `window_seconds` apart, **inclusive**;
+  * `ordered: true`: steps follow the listed order by (timestamp, arrival rank). Equal timestamps are ordered by the
+    order in which `evaluate` accepted them, never by event id. `ordered: false` drops this constraint;
+  * lineage on the graph as it is when the anchor arrives: `same` (the same `process_instance_id`), `child_of` (one
+    observed parent link), `descendant_of` (up to `max_depth` links; `include_self` also accepts the same process).
+    Links pass through placeholders but never across a missing node, and PIDs are never used;
+  * every bound process is still in the graph.
+* **One detection per distinct root.** The search enumerates the complete bindings of every anchor position (in
+  step order) and computes each binding's root. The first binding found for a root is that root's **preferred**
+  binding; later, equivalent bindings of the same root are dropped. Each distinct `(rule, root)` is reported once,
+  with its own bindings, evidence, `process_by_step`, placeholder and inferred-identity facts, `matched_at` and
+  response target. Evidence of different roots is never combined. Example (`test_engine_sequence.py`): under nested
+  interpreters `py1 -> py2 -> bash`, one connection gives two matches, `interp = py2` (root `c`) and `interp = py1`
+  (root `b`). Within a rule, results are in discovery order.
+* **Preference, deterministic.** A depth-first search in step order; per step, the candidate nearest to the
+  triggering event's time is tried first, then the latest arrival. In an ordered rule the earliest bound event is
+  step 0's, so the step-0 candidate fixes the root: a candidate whose root is already found is skipped, and once a
+  binding completes the search moves to the next step-0 candidate. An unordered rule has no such shortcut and spends
+  budget on equivalent bindings.
+* **`matched_at` and the trigger.** `matched_at` is the latest bound **event time** (logical completion of the
+  sequence); `trigger_event_id` is the event whose `evaluate` call completed it, which is a late, earlier-stamped
+  event when delivery is out of order. Order and windows use event time; arrival order only breaks timestamp ties.
+* **Suppression per root.** Each root found by one evaluation is registered once, independently. One event can be a
+  new `EngineMatch` for one root and a `SuppressedMatch` for another, and a repeat of root A never suppresses root B.
+* **After a match.** Candidates are not consumed. Another completion for the same `(rule, root)` inside the incident
+  window is a `SuppressedMatch` with its own complete binding, ready to be added to the incident as evidence (A4).
+  Suppression is timed by `matched_at`.
+
+**Coverage is complete only when the search is exhaustive.** Each way a sequence can be lost is counted. A plain miss
+(a step that never happened) is not counted:
+
+| Counter | When |
+|---|---|
+| `sequence_candidates_expired` | a candidate removed at `max_candidates_per_step` that was outside the rule window of the event that caused the removal. Under out-of-order delivery a later event could still have needed it, so this is a weaker loss signal, not proof of harmlessness |
+| `sequence_candidates_evicted` | a candidate removed at the cap while still inside the window (rate-limited warning): a detection may be missed |
+| `sequence_searches_truncated` | a (rule, event) search did not try candidates beyond `max_search_candidates` |
+| `sequence_searches_exhausted` | a (rule, event) search ran out of its shared `max_search_nodes` budget before it ended (rate-limited warning) |
+| `sequence_candidates_unavailable` | a (rule, event) search skipped in-window candidates whose process left the graph |
+
+The three search counters are counted **once per (rule, event)**, whatever the number of anchor positions, and
+**also when roots were found**: the roots already found are reported, and another root may have been missed. A search
+that ends exactly at its budget is complete and not counted. An anchor position where some step has no candidate at
+all cannot bind, so limits on its other steps are not counted.
+
+The cap removes the **oldest** candidate by (timestamp, arrival), which can be the new one itself if it is the oldest.
+That favours recent activity, and a burst of matching events can push out an older candidate that a later event still
+needed: that is what `sequence_candidates_evicted` counts. The expired and evicted labels are judged at one event's time,
+so out-of-order streams can make them misleading, as for the suppression counters.
+
 ### Limits (`EngineLimits`)
 Counts of items, not bytes. Invalid or mutually inconsistent values raise `ValueError`.
 
-| Field | Default | Effect in A3a |
+| Field | Default | Effect |
 |---|---|---|
 | `max_seen_events` | 50000 | deduplication horizon |
 | `max_suppression_entries` | 4096 | suppression cap |
 | `max_future_skew_seconds` | 300 | live mode future check |
-| `max_candidates_per_step` | 128 | startup capacity check only |
-| `max_total_candidate_events` | 50000 | startup capacity check only |
+| `max_candidates_per_step` | 128 | sequence candidates kept per rule step |
+| `max_total_candidate_events` | 50000 | startup capacity check: the per-step caps of all sequence steps must fit in it |
+| `max_search_candidates` | 64 | candidates tried per step and anchor position |
+| `max_search_nodes` | 2000 | candidates examined per (rule, event), shared by all its anchor positions, before the search stops |
 | `max_values_per_key` | 128 | disables threshold rules whose `min_distinct` is larger |
-| `max_search_candidates` | 64 | reserved for A3b (validated) |
-| `max_search_nodes` | 2000 | reserved for A3b (validated) |
-| `max_threshold_keys` | 1024 | reserved for A3b (validated, shown by `state_bounds()`) |
-| `max_threshold_bindings` | 200 | reserved for A3b (validated) |
+| `max_threshold_keys` | 1024 | reserved for threshold rules (validated, shown by `state_bounds()`) |
+| `max_threshold_bindings` | 200 | reserved for threshold rules (validated) |
+
+The work per accepted event is bounded: for each sequence rule it listens to, the search reads each other step's store
+once per anchor position (at most `max_candidates_per_step` entries), sorts at most that many, and examines at most
+`max_search_nodes` candidates for the whole (rule, event). The distinct roots it returns are therefore bounded too,
+because every complete binding costs at least one examined candidate. A full store also scans its entries once to
+choose what to remove. Enumerating all roots costs more than stopping at the first binding: a search that finds a
+root keeps going until it is exhaustive or the budget runs out.
 
 ### Statistics and state
 * `engine.stats()` returns an `EngineStats` snapshot: the counters above plus `events_received`, `seen_evicted`,
   `matches_emitted`, `matches_suppressed`, `placeholder_starts_skipped`, `suppression_expired`,
-  `suppression_evicted`, `rules_enabled`, `rules_disabled` and `rules_rejected_at_load`.
+  `suppression_evicted`, the five sequence counters, `rules_enabled`, `rules_disabled` and `rules_rejected_at_load`.
 * `engine.state_bounds()` gives upper bounds in item counts (`seen_event_ids`, `suppression_entries`,
-  `candidate_events`, `threshold_keys`, `threshold_value_records`; the last three describe A3b structures that do not
-  exist yet).
-* `engine.state_sizes()` gives what is retained now (`seen_events`, `suppression_entries`), including expired entries.
+  `candidate_events`, `threshold_keys`, `threshold_value_records`; the last two describe threshold structures that do
+  not exist yet).
+* `engine.state_sizes()` gives what is retained now (`seen_events`, `suppression_entries`, `candidate_events`),
+  including expired entries and old candidates. One event counts once per step it satisfies.
 * Also: `enabled_rules`, `disabled_rules`, `load_errors`, `endpoint_id`, `arrival_count` and
-  `index_for(os_name, event_type)`, which lists listening steps, including ones that are not evaluated yet.
+  `index_for(os_name, event_type)`, which lists listening steps, including threshold steps that are not evaluated yet.
 
 ### Errors
 An exception raised while an event is being prepared (for example by a regex backend) propagates and leaves suppression
-state, detection counters and the seen record unchanged (`events_received` still counts the call), so the event can be
+state, sequence candidates, detection counters and the seen record unchanged (`events_received` still counts the call), so the event can be
 retried. A logging handler or filter that raises an ordinary exception during `evaluate` is ignored. `MemoryError`,
 `KeyboardInterrupt` and `SystemExit` are not suppressed and updates are not transactional: one raised after the commit
 began loses that call's results, and a retry may not recover them. Recovery is left to the agent loop (A8).
 
-### Known limitations of the engine (A3a)
-* No sequence or threshold detection ([Detection coverage](#detection-coverage-today)), and no regex backend.
+### Known limitations of the engine
+* No threshold detection ([Detection coverage](#detection-coverage-today)), and no regex backend.
+* Sequence detection is bounded, and in-memory only: candidate state does not survive a restart, a full step store
+  drops its oldest candidate, and a search tries a limited number of candidates. Each such loss is counted (see
+  [Sequence rules](#sequence-rules-a3b-phase-1)), but the detection is not recovered.
+* **Distinct roots are complete only within the search limits.** Every distinct root is reported when the search is
+  exhaustive. When `max_search_nodes`, `max_search_candidates`, a full candidate store or a process gone from the graph
+  stops it, the roots found are reported and the loss is counted, but further roots are not recovered.
+* Unordered rules spend search budget on equivalent same-root bindings (only ordered rules can skip them), so they
+  reach `max_search_nodes` sooner under heavy matching load.
+* A sequence's lineage is judged on the graph when the anchor arrives. A parent link that only appears later is not
+  revisited for candidates already passed over, and a bound process must still be in the graph.
+* The root of a sequence is an ancestor of its earliest bound process only. In an unordered rule this need not be an
+  ancestor of every bound process.
+* The sequence engine has been tested with synthetic events and the two repository fixtures, not with a live sensor.
 * Single-threaded.
 * Deduplication and suppression are bounded, in-memory and best effort; neither survives a restart.
 * No incident builder, persistence, transport or response, and no agent loop that connects it to an adapter.
