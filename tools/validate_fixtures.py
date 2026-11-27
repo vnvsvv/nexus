@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
 """Validates every fixture against the JSON Schemas AND the Pydantic models.
 
-Run from repo root:  python tools/validate_fixtures.py
+Run from repo root:  python tools/validate_fixtures.py [--require-ml]
 Exit code 0 = all good. Used by CI and by every member before pushing a contract change.
 Optional checks run only if the relevant package is importable:
   - nexus_endpoint_core: runs rule fixtures (events -> expected rule match)
-  - nexus_ml: checks feature parity fixture (dataset row vs NFStream fields -> identical vector)
+  - nexus_ml: checks feature parity fixture (dataset row and NFStream fields -> the expected vector, under the
+    comparison policy of contracts/flow-features.md). A missing nexus_ml is skipped unless --require-ml is given;
+    a nexus_ml that is installed but fails to import or convert is always a failure.
 """
 from __future__ import annotations
 
+import argparse
+import importlib
 import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(1, str(ROOT / "tools"))
 
 from nexus_contracts import (  # noqa: E402
     HostEvent, Incident, GatewayConnection, FlowRecord, ResponseCommand, ResponseResult, Heartbeat, ServerIncidentView,
     validate_against_schema,
 )
+from feature_parity import compare_vector, fixture_problems  # noqa: E402
+
+parser = argparse.ArgumentParser(description="Validate every contract fixture.")
+parser.add_argument("--require-ml", action="store_true",
+                    help="fail instead of skipping the feature parity check when nexus_ml is not installed")
+args = parser.parse_args()
 
 FIX = ROOT / "contracts" / "fixtures"
 failures: list[str] = []
@@ -86,18 +97,33 @@ try:
 except ImportError:
     print("nexus_endpoint_core not installed; rule fixtures schema-checked only")
 
-# optional: feature parity
+# feature parity: the fixture is always checked; the converters when nexus_ml is installed (or required)
+fx = json.loads((FIX / "flow_feature_fixture.json").read_text(encoding="utf-8"))
+parity = [f"feature parity fixture: {problem}" for problem in fixture_problems(fx)]
+features = None
 try:
-    from nexus_ml.features import from_dataset_row, from_nflow_fields  # type: ignore
-    fx = json.loads((FIX / "flow_feature_fixture.json").read_text())
-    a = from_dataset_row(fx["dataset_row"])
-    b = from_nflow_fields(fx["nflow_fields"])
-    if a != fx["expected_vector"] or b != fx["expected_vector"]:
-        failures.append("feature parity fixture: vectors differ\n dataset=%s\n nflow=%s\n expected=%s" % (a, b, fx["expected_vector"]))
+    features = importlib.import_module("nexus_ml.features")
+except ModuleNotFoundError as e:
+    if e.name != "nexus_ml":                            # nexus_ml exists, but it or something it imports is missing
+        parity.append(f"feature parity: nexus_ml is installed but importing nexus_ml.features failed: {e!r}")
+    elif args.require_ml:
+        parity.append("feature parity: nexus_ml is required (--require-ml) but not installed")
     else:
-        print("feature parity fixture OK")
-except ImportError:
-    print("nexus_ml not installed; feature parity fixture skipped")
+        print("nexus_ml not installed; feature parity fixture skipped")
+except Exception as e:  # noqa: BLE001
+    parity.append(f"feature parity: nexus_ml is installed but importing nexus_ml.features failed: {e!r}")
+if features is not None:
+    for label, converter, source in (("dataset path", "from_dataset_row", "dataset_row"),
+                                     ("NFStream path", "from_nflow_fields", "nflow_fields")):
+        try:
+            computed = getattr(features, converter)(fx[source])
+        except Exception as e:  # noqa: BLE001
+            parity.append(f"feature parity: {label}: nexus_ml.features.{converter} raised {e!r}")
+            continue
+        parity += [f"feature parity: {problem}" for problem in compare_vector(computed, fx["expected_vector"], label)]
+    if not parity:
+        print("feature parity fixture OK (dataset and NFStream paths)")
+failures += parity
 
 if failures:
     print("\nFAILURES:")

@@ -27,7 +27,7 @@ Lab traffic (benign baseline and the scripted scenarios from `07-DEMO-AND-EVALUA
 
 ## 3. Feature contract `nf-lite-1` (frozen; full text in `contracts/flow-features.md`)
 
-Principles: only features that NFStream can produce from packet headers in a bidirectional flow, with one explicit formula each; dataset column ↔ NFStream field mapping written down; identical ordered vector on both sides; a shared fixture (`contracts/fixtures/flow_feature_fixture.json`) that both `nexus_ml.features.from_dataset_row()` and `nexus_ml.features.from_nflow()` must reproduce exactly.
+Principles: only features that NFStream can produce from packet headers in a bidirectional flow, with one explicit formula each; dataset column ↔ NFStream field mapping written down; identical ordered vector on both sides; a shared fixture (`contracts/fixtures/flow_feature_fixture.json`) that both `nexus_ml.features.from_dataset_row()` and `nexus_ml.features.from_nflow()` must reproduce: exactly for the feature names, their order and the integer features, and within the float tolerance defined in `contracts/flow-features.md` ("Fixture comparison") for the computed float features.
 
 Direction convention: dataset `IN_*` = client→server = NFStream `src2dst_*`; `OUT_*` = server→client = `dst2src_*`. **[verify W1 against the dataset paper and a few rows; if reversed, flip the mapping in one place — `features.py` — not in the trainer.]**
 
@@ -58,7 +58,7 @@ Rules: pure CPU, no I/O at predict time, < 1 ms per flow, raises on missing/extr
 | Dataset test-split metrics | Standard; reported but not the headline. |
 | **Benign lab baseline** | ≥ 1 h of ordinary lab activity (updates, browsing the internal web service, file copies) → alerts per hour at the chosen threshold. This is the number judges will ask about. |
 | **Scripted scenario recall** | Each demo scenario's flows: fraction labelled suspicious; which families generalize, which do not. |
-| Feature-parity test | Fixture equality test in CI; plus a 50-flow comparison between NFStream-on-pcap and the live path on the gateway. |
+| Feature-parity test | Fixture parity test in CI (the comparison in `contracts/flow-features.md`); plus a 50-flow comparison between NFStream-on-pcap and the live path on the gateway. |
 | Latency | Flow expiry → prediction available; connection start → prediction available (dominated by the 15 s idle timeout; state it). |
 | Ablation (optional) | Drop `l4_dst_port`; report the change. Port is a known shortcut feature. |
 
