@@ -42,10 +42,27 @@ Rules that keep this simple and recoverable:
 5. **Least privilege:** the network-facing API has no capabilities. Only `nexus-response` can change nftables, and it re-validates every command, defaults to `dry_run=true`, and runs `nft` with fixed argument lists, never a shell string. Endpoint commands are never executed on the gateway; agents poll them.
 
 ## Run
-TODO (R3+).
+Development only (R3a: incident upsert, heartbeat, incident view). From the repo root:
+```bash
+pip install -e . && pip install -r server/requirements.txt
+export NEXUS_DB_URL=postgresql+psycopg://nexus:CHANGE_ME@localhost:5432/nexus NEXUS_DASHBOARD_TOKEN=...
+python -m server.manage init-db                      # create tables (idempotent)
+python -m server.manage gen-token linux-vm-01 --os linux   # prints the agent token once
+uvicorn --factory server.api:create_app --port 8000  # TLS and port 8443 come in R3b
+```
+Endpoints so far: `POST /api/v1/incidents`, `POST /api/v1/endpoints/{id}/heartbeat`, `GET /api/v1/incidents/{id}` (dashboard token). The rest of `openapi.yaml` is TODO (R3b).
 
 ## Test with fixtures
-TODO (R2): `pytest -q server/tests` with `NEXUS_TEST_DB_URL` pointing at a dedicated test database.
+```bash
+pip install -e . && pip install -r server/requirements.txt
+python tools/validate_fixtures.py
+pytest -q server/tests                                  # DB tests skip without a test DB
+NEXUS_TEST_DB_URL=postgresql+psycopg://nexus:CHANGE_ME@localhost:5432/nexus_test pytest -q server/tests
+```
+The DB tests run only if the database name in `NEXUS_TEST_DB_URL` contains `test`. Each run creates its own schema (`nexus_pytest_<random>`) and drops it at the end, so nothing outside that schema is touched. A throwaway PostgreSQL for this (no install on the host):
+`docker run --rm -d --name nexus-pg-test -e POSTGRES_USER=nexus -e POSTGRES_PASSWORD=CHANGE_ME -e POSTGRES_DB=nexus_test -p 5432:5432 postgres:16` (stop with `docker stop nexus-pg-test`).
+
+`test_api.py` posts `incident_linux_l1.json` and `heartbeat_example.json`, and rebuilds `server_incident_view_linux_l1.json` from table rows, then checks the result equals the fixture (except `enrichment`, TODO R7) and validates against `server_incident_view.schema.json` and the Pydantic model.
 
 ## Run against mock server
 TODO (R3+).
